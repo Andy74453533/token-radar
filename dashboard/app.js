@@ -1,8 +1,10 @@
-// Launch Radar: a plain page over window.RADAR, no network, no framework.
-// The board ranks pre-token protocols by implied value; the "Already trading"
-// tab shows the live set apart, with the market's own values. The detail view
-// recomputes each row's implied value from the snapshot figures and the
-// published calibration, so the page's arithmetic and the board's data agree.
+// Launch Radar v2: a plain page over window.RADAR, no network, no framework.
+// The board ranks pre-token protocols by the fitted power law; the "Already
+// trading" tab shows the live set apart, with the market's own values. The
+// detail view recomputes each row's implied value from the snapshot figures
+// and the published fit, so the page's arithmetic and the board's data
+// agree, and the research note shows the fit, the backtest and the chart
+// the value model stands on.
 (function () {
   'use strict';
   var D = window.RADAR;
@@ -34,25 +36,26 @@
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
   }
+  function log10(n) { return Math.log(n) / Math.LN10; }
 
   // The model, recomputed in the page from the row's own figures and the
-  // calibration table: multiple x growth x seasoning x reach, exactly as
-  // lib/model.ts scores it.
-  function multipleFor(row) {
+  // published fit: the power-law curve, the category offset, the growth
+  // factor and the seasoning factor, exactly as lib/model.ts scores it.
+  function offsetFor(row) {
     var key = row.category === null ? '(uncategorised)' : row.category;
-    for (var i = 0; i < D.calibration.rows.length; i++) {
-      if (D.calibration.rows[i].category === key) return D.calibration.rows[i].multiple;
+    for (var i = 0; i < D.fit.offsets.length; i++) {
+      if (D.fit.offsets[i].category === key) return D.fit.offsets[i].offset;
     }
-    return D.calibration.global_median;
+    return 0;
   }
   function recompute(row) {
     var t = D.tune;
     var growth = Math.min(t.growth_cap, Math.max(t.growth_floor, row.change_7d === null ? 0 : row.change_7d));
     var gf = 1 + (growth / 100) * t.growth_weight;
     var age = row.age_days === null ? t.unknown_age_days : row.age_days;
-    var af = t.age_floor + (Math.min(Math.max(age, 0), t.age_cap_days) / t.age_cap_days) * t.age_span;
-    var cf = 1 + t.chain_step * Math.min(Math.max(row.chains.length - 1, 0), t.chain_cap);
-    return Math.max(1, Math.round(row.tvl_usd * multipleFor(row) * gf * af * cf));
+    var af = 1 + t.age_amplitude * (Math.min(Math.max(age, 0), t.age_cap_days) / t.age_cap_days - 0.5);
+    var logValue = D.fit.intercept + D.fit.slope * log10(row.tvl_usd) + offsetFor(row) + log10(gf) + log10(af);
+    return Math.max(1, Math.round(Math.pow(10, logValue)));
   }
 
   function readHash() {
@@ -119,6 +122,16 @@
     ['implied', 'Implied value'],
   ];
 
+  function renderModelLine() {
+    var f = D.fit, b = D.backtest;
+    document.getElementById('modelline').innerHTML =
+      '<b>Value model:</b> log&#8321;&#8320;(mcap) = ' + f.intercept.toFixed(3) + ' + ' + f.slope.toFixed(3) +
+      ' &middot; log&#8321;&#8320;(TVL), fitted on ' + f.kept_count + ' live protocols (' + f.trimmed_count +
+      ' trimmed) &middot; R&sup2; ' + f.r_squared.toFixed(3) + ' &middot; leave-one-out backtest: median error ' +
+      b.median_pct.toFixed(0) + '%, ' + Math.round(b.within_2x * 100) + '% within 2&times; (naive median: ' +
+      b.baseline_median_pct.toFixed(0) + '%, ' + Math.round(b.baseline_within_2x * 100) + '% within 2&times;)';
+  }
+
   function renderStats() {
     var el = document.getElementById('stats');
     var max = D.rows.length ? D.rows[0].implied_value_usd : 0;
@@ -131,17 +144,82 @@
     ].map(function (kv) { return '<div><dt>' + kv[0] + '</dt><dd>' + kv[1] + '</dd></div>'; }).join('');
   }
 
-  function renderMethod() {
-    var t = D.tune;
-    var top = D.calibration.rows.filter(function (r) { return r.live_count > 0; })
-      .sort(function (a, b) { return b.live_count - a.live_count; }).slice(0, 8);
-    var rows = top.map(function (r) {
-      return '<tr><td>' + esc(r.category) + '</td><td>' + r.multiple.toFixed(3) + 'x</td><td>' + r.live_count + ' live</td><td>' + (r.median_ratio === null ? 'n/a' : r.median_ratio.toFixed(3) + 'x') + '</td></tr>';
+  // Log-log scatter: every live protocol's TVL against its market cap, the
+  // fitted curve through them, and the watchlist's protocols placed on the
+  // curve at their implied values. Built from the data, no image files.
+  function scatterSVG() {
+    var W = 560, H = 300, L = 52, R = 14, T = 12, B = 34;
+    var xs = D.scatter.map(function (p) { return log10(p.tvl_usd); });
+    var ys = D.scatter.map(function (p) { return log10(p.mcap_usd); });
+    var marks = D.rows.filter(function (r) { return r.watchlist; });
+    marks.forEach(function (r) { xs.push(log10(r.tvl_usd)); ys.push(log10(r.implied_value_usd)); });
+    var x0 = Math.floor(Math.min.apply(null, xs)), x1 = Math.ceil(Math.max.apply(null, xs));
+    var y0 = Math.floor(Math.min.apply(null, ys)), y1 = Math.ceil(Math.max.apply(null, ys));
+    function X(v) { return L + (v - x0) / (x1 - x0) * (W - L - R); }
+    function Y(v) { return T + (y1 - v) / (y1 - y0) * (H - T - B); }
+    function tickLabel(v) {
+      var n = Math.pow(10, v);
+      if (n >= 1e9) return '$' + (n / 1e9) + 'B';
+      if (n >= 1e6) return '$' + (n / 1e6) + 'M';
+      return '$' + Math.round(n / 1e3) + 'K';
+    }
+    var out = ['<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="TVL against market cap, log scales, with the fitted curve">'];
+    var v;
+    for (v = x0; v <= x1; v++) {
+      out.push('<line class="grid" x1="' + X(v).toFixed(1) + '" y1="' + T + '" x2="' + X(v).toFixed(1) + '" y2="' + (H - B) + '"/>');
+      out.push('<text class="tick" x="' + X(v).toFixed(1) + '" y="' + (H - B + 16) + '" text-anchor="middle">' + tickLabel(v) + '</text>');
+    }
+    for (v = y0; v <= y1; v++) {
+      out.push('<line class="grid" x1="' + L + '" y1="' + Y(v).toFixed(1) + '" x2="' + (W - R) + '" y2="' + Y(v).toFixed(1) + '"/>');
+      out.push('<text class="tick" x="' + (L - 6) + '" y="' + (Y(v).toFixed(1) + 3) + '" text-anchor="end">' + tickLabel(v) + '</text>');
+    }
+    out.push('<text class="tick" x="' + ((W + L - R) / 2).toFixed(1) + '" y="' + (H - 4) + '" text-anchor="middle">TVL (log scale)</text>');
+    out.push('<text class="tick" x="12" y="' + ((H + T - B) / 2).toFixed(1) + '" text-anchor="middle" transform="rotate(-90 12 ' + ((H + T - B) / 2).toFixed(1) + ')">Market cap / implied value (log scale)</text>');
+    var cx0 = X(x0), cy0 = Y(D.fit.intercept + D.fit.slope * x0);
+    var cx1 = X(x1), cy1 = Y(D.fit.intercept + D.fit.slope * x1);
+    out.push('<line class="curve" x1="' + cx0.toFixed(1) + '" y1="' + cy0.toFixed(1) + '" x2="' + cx1.toFixed(1) + '" y2="' + cy1.toFixed(1) + '"/>');
+    D.scatter.forEach(function (p) {
+      out.push('<circle class="dot" cx="' + X(log10(p.tvl_usd)).toFixed(1) + '" cy="' + Y(log10(p.mcap_usd)).toFixed(1) + '" r="2.6"><title>' + esc(p.name) + '</title></circle>');
+    });
+    marks.forEach(function (r) {
+      out.push('<circle class="mark" cx="' + X(log10(r.tvl_usd)).toFixed(1) + '" cy="' + Y(log10(r.implied_value_usd)).toFixed(1) + '" r="4"><title>' + esc(r.name) + '</title></circle>');
+    });
+    out.push('<line class="axis" x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - R) + '" y2="' + (H - B) + '"/>');
+    out.push('<line class="axis" x1="' + L + '" y1="' + T + '" x2="' + L + '" y2="' + (H - B) + '"/>');
+    out.push('</svg>');
+    return out.join('');
+  }
+
+  function renderResearch() {
+    var t = D.tune, f = D.fit, b = D.backtest;
+    var offs = f.offsets.slice().sort(function (a, b2) { return Math.abs(b2.offset) - Math.abs(a.offset); }).slice(0, 8);
+    var offRows = offs.map(function (o) {
+      return '<tr><td>' + esc(o.category) + '</td><td>' + (o.offset >= 0 ? '+' : '') + o.offset.toFixed(3) + '</td><td>x' + o.offset_factor.toFixed(3) + '</td><td>' + o.live_count + ' live</td></tr>';
     }).join('');
-    document.getElementById('method').innerHTML =
-      '<h2>How the value is built</h2>' +
-      '<p><code>implied = TVL x category multiple x growth x seasoning x reach</code>. The multiple is calibrated from this snapshot alone: the median market-cap-to-TVL ratio of the protocols in each category whose token already trades — each live ratio capped at 2x first, so one tiny protocol cannot set a whole category — shrunk toward the snapshot-wide median (' + D.calibration.global_median.toFixed(3) + 'x, from ' + D.calibration.live_protocols + ' live protocols) and clamped to [' + t.multiple_floor + ', ' + t.multiple_cap + ']. Growth is the 7-day TVL change clamped to [' + t.growth_floor + '%, +' + t.growth_cap + '%] at weight ' + t.growth_weight + '; seasoning runs from ' + t.age_floor + ' to ' + (t.age_floor + t.age_span).toFixed(1) + ' over ' + t.age_cap_days + ' days; each extra chain past the first adds ' + (t.chain_step * 100) + '% (max ' + t.chain_cap + '). No protocol name is ever special-cased.</p>' +
-      '<table><thead><tr><th>Category</th><th>Multiple</th><th>Evidence</th><th>Raw median</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    document.getElementById('research').innerHTML =
+      '<h2>Research note: the fit and the backtest</h2>' +
+      '<p>The value model is a power law fitted to this snapshot alone. Least squares on the ' + f.live_count +
+      ' protocols that record a positive market cap and TVL gives <code>log&#8321;&#8320;(mcap) = ' + f.intercept.toFixed(4) +
+      ' + ' + f.slope.toFixed(4) + ' &middot; log&#8321;&#8320;(TVL)</code>, after one round of trimming residuals past ' + t.trim_sd +
+      ' standard deviations (' + f.trimmed_count + ' protocols trimmed, ' + f.kept_count + ' kept). The slope under 1 is the market speaking: ' +
+      'large protocols carry a lower market-cap-to-TVL ratio than small ones, so the curve bends down as TVL grows. ' +
+      'Each category then earns a shrunk offset from its own residuals (prior ' + t.shrink_prior + '), growth is the 7-day TVL change clamped to [' +
+      t.growth_floor + '%, +' + t.growth_cap + '%] at weight ' + t.growth_weight + ', and seasoning moves the value by at most &plusmn;' +
+      (t.age_amplitude * 100) + '% over ' + t.age_cap_days + ' days. No protocol name is ever special-cased; the same formulas score every row.</p>' +
+      '<div class="twocol"><div>' +
+      '<h3>Backtest: leave-one-out over ' + b.n + ' live protocols</h3>' +
+      '<p>Each live protocol is held out in turn, the curve and offsets are refit on the rest, and its market cap is predicted from its TVL, growth and age alone.</p>' +
+      '<table><thead><tr><th>Model</th><th>Mean log error</th><th>Median error</th><th>Within 2&times;</th></tr></thead><tbody>' +
+      '<tr><td>Fitted power law</td><td>' + b.mae_log.toFixed(3) + '</td><td>' + b.median_pct.toFixed(0) + '%</td><td>' + Math.round(b.within_2x * 100) + '%</td></tr>' +
+      '<tr><td>Naive median ratio</td><td>' + b.baseline_mae_log.toFixed(3) + '</td><td>' + b.baseline_median_pct.toFixed(0) + '%</td><td>' + Math.round(b.baseline_within_2x * 100) + '%</td></tr>' +
+      '</tbody></table>' +
+      '<p>The fit beats the naive baseline on every column, and the backtest is honest about the residue: token values scatter widely around any TVL curve (residual SD ' + f.resid_sd.toFixed(3) + ' dex, R&sup2; ' + f.r_squared.toFixed(3) + '). The board ranks by the fitted centre, not by a promise.</p>' +
+      '<h3>Largest category offsets</h3>' +
+      '<table><thead><tr><th>Category</th><th>Offset</th><th>Factor</th><th>Evidence</th></tr></thead><tbody>' + offRows + '</tbody></table>' +
+      '</div><div class="chart">' + scatterSVG() +
+      '<div class="legend"><span><i class="l-dot"></i>Live protocol (TVL vs market cap)</span><span><i class="l-mark"></i>Watchlist protocol (TVL vs implied value)</span><span><i class="l-curve"></i>Fitted curve</span></div>' +
+      '<p class="cap" style="margin-top:8px">The curve runs through the live market; the watchlist sits on it at its implied values. Both axes are logarithmic.</p>' +
+      '</div></div>';
   }
 
   function renderControls() {
@@ -232,16 +310,29 @@
     var row = null;
     for (var i = 0; i < D.rows.length; i++) if (D.rows[i].slug === state.selected) row = D.rows[i];
     if (!row) {
-      box.innerHTML = '<h2>Detail view</h2><p class="empty">Select a protocol on the board to see its snapshot record, the model breakdown behind its implied value, and its farm plan.</p>';
+      box.innerHTML = '<h2>Detail view</h2><p class="empty">Select a protocol on the board to see its snapshot record, the fitted breakdown behind its implied value, the live protocols it is priced against, and its farm plan.</p>';
       return;
     }
     var again = recompute(row);
     var b = row.breakdown;
+    var comps = row.comparables.map(function (c) {
+      return '<li><span class="cname">' + esc(c.name) + (c.same_category ? ' <span class="same">same category</span>' : '') + '</span>' +
+        '<span class="cnum">' + money(c.tvl_usd) + ' TVL &middot; ' + money(c.mcap_usd) + ' mcap &middot; ' + c.ratio.toFixed(3) + 'x</span></li>';
+    }).join('');
     box.innerHTML =
       '<h2>' + esc(row.name) + '</h2>' +
       '<p class="sub">' + esc(row.slug) + (row.watchlist ? ' · on the watchlist' : ' · early find') + ' · records no token</p>' +
       '<p class="value">' + moneyFull(row.implied_value_usd) + '</p>' +
       '<p class="value-note">Implied value, rank #' + row.rank + ' of ' + D.rows.length + '</p>' +
+      '<h3>Fitted breakdown</h3><dl>' +
+      '<dt>Power-law curve</dt><dd>' + moneyFull(b.curve_value) + '</dd>' +
+      '<dt>Category offset</dt><dd>' + (b.offset >= 0 ? '+' : '') + b.offset.toFixed(3) + ' dex (x' + b.offset_factor.toFixed(3) + ')</dd>' +
+      '<dt>Growth used</dt><dd>' + pct(b.growth_pct) + ' → x' + b.growth_factor.toFixed(3) + '</dd>' +
+      '<dt>Seasoning</dt><dd>x' + b.age_factor.toFixed(3) + '</dd>' +
+      '</dl>' +
+      '<p class="match">' + (again === row.implied_value_usd ? 'Recomputed in this page: matches the board.' : 'Recomputed in this page: ' + moneyFull(again) + '.') + '</p>' +
+      '<h3>Priced against</h3><ul class="comps">' + comps + '</ul>' +
+      '<p class="value-note">Nearest live protocols by TVL size. Evidence for the curve, not the value itself.</p>' +
       '<h3>Snapshot record</h3><dl>' +
       '<dt>Category</dt><dd>' + esc(row.category || '—') + '</dd>' +
       '<dt>Chains</dt><dd>' + row.chains.map(esc).join(', ') + '</dd>' +
@@ -250,13 +341,6 @@
       '<dt>Listed</dt><dd>' + esc(row.listed_at || 'unknown') + ' (' + ageText(row.age_days) + ')</dd>' +
       '<dt>Market cap</dt><dd>none recorded</dd>' +
       '</dl>' +
-      '<h3>Model breakdown</h3><dl>' +
-      '<dt>Category multiple</dt><dd>' + b.multiple.toFixed(3) + 'x</dd>' +
-      '<dt>Growth used</dt><dd>' + pct(b.growth_pct) + ' → x' + b.growth_factor.toFixed(3) + '</dd>' +
-      '<dt>Seasoning</dt><dd>x' + b.age_factor.toFixed(3) + '</dd>' +
-      '<dt>Reach</dt><dd>x' + b.chain_factor.toFixed(3) + '</dd>' +
-      '</dl>' +
-      '<p class="match">' + (again === row.implied_value_usd ? 'Recomputed in this page: matches the board.' : 'Recomputed in this page: ' + moneyFull(again) + '.') + '</p>' +
       '<h3>Farm plan</h3><ol>' + row.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ol>';
   }
 
@@ -265,7 +349,7 @@
     if (state.tab !== 'live') { sec.hidden = true; return; }
     sec.hidden = false;
     sec.innerHTML = '<h2>Already trading — kept apart on purpose</h2>' +
-      '<p>These ' + D.live.length + ' protocols record a token, so the market already prices them. Their market caps are shown above in place of an implied value, and the same live protocols calibrate the category multiples the board uses. A protocol leaves this list for the board only when its record shows no token.</p>';
+      '<p>These ' + D.live.length + ' protocols record a token, so the market already prices them. Their market caps are shown above in place of an implied value, and the same live protocols fit the power law the board uses. A protocol leaves this list for the board only when its record shows no token.</p>';
   }
 
   function renderTabs() {
@@ -291,8 +375,9 @@
     document.getElementById('watch').checked = state.watch;
     render();
   });
+  renderModelLine();
   renderStats();
-  renderMethod();
+  renderResearch();
   renderControls();
   document.getElementById('source').textContent = 'Source: ' + D.source + '. Snapshot date: ' + D.as_of + '. Model: ' + D.model_name + '.';
   render();
