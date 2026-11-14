@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Launch Radar — pre-token protocols ranked by implied value</title>
+<title>Launch Radar — pre-token protocols ranked by fitted implied value</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="app.css">
 </head>
@@ -12,7 +12,8 @@
   <div class="wrap">
     <p class="kicker">Token launch radar</p>
     <h1>Protocols that record no token yet, ranked by what a token would be worth</h1>
-    <p class="lede">Every figure comes from one sealed snapshot. The board ranks only protocols whose record shows no token; protocols whose token already trades are shown apart, with the market's own value, and never mixed into the ranking.</p>
+    <p class="lede">Every figure comes from one sealed snapshot, and every value is fitted from it: a power law through the protocols whose token already trades, backtested before it ranks anything. The board ranks only protocols whose record shows no token; protocols whose token already trades are shown apart, with the market's own value, and never mixed into the ranking.</p>
+    <p class="modelline" id="modelline"></p>
     <dl class="stats" id="stats"></dl>
   </div>
 </header>
@@ -34,14 +35,14 @@
         <thead><tr id="headrow"></tr></thead>
         <tbody id="rows"></tbody>
       </table>
-      <p class="hint">Click a column heading to sort. Click a row for its detail view, model breakdown and farm plan.</p>
+      <p class="hint">Click a column heading to sort. Click a row for its detail view: the fitted breakdown, the live protocols it is priced against, and its farm plan.</p>
     </div>
     <aside class="detail" id="detail" aria-label="Protocol detail"></aside>
   </div>
-  <section class="method" id="method" aria-label="How the value is built"></section>
+  <section class="research" id="research" aria-label="Research note: the fit and the backtest"></section>
   <section class="live" id="live" hidden aria-label="Protocols whose token already trades"></section>
   <footer class="foot">
-    <p><strong>Reading the board.</strong> “Records no token” means the snapshot's own record carries no market cap, CoinGecko id or symbol — it is not proof a protocol has no token. Implied value is this entry's own claim from the snapshot's figures, never a prediction that a token is issued, or when. Farm plans are starting points: check the protocol's own pages before moving funds.</p>
+    <p><strong>Reading the board.</strong> “Records no token” means the snapshot's own record carries no market cap, CoinGecko id or symbol — it is not proof a protocol has no token. Implied value is this entry's own claim from the snapshot's figures, fitted and backtested, never a prediction that a token is issued, or when. Farm plans are starting points: check the protocol's own pages before moving funds.</p>
     <p id="source"></p>
   </footer>
 </main>
