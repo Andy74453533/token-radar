@@ -1,18 +1,19 @@
-// Launch Radar v2: the token-radar-01 entrypoint (Node 22, standard library only).
+// Launch Radar v3: the token-radar-01 entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, fits the power-law model in lib/model.ts to the
-// snapshot's own live protocols, backtests it, and writes the whole entry to
-// the output directory: board.json, data.js, the dashboard, the screenshots,
-// and dossier.json last (the gate re-derives it byte-for-byte, so the
-// vendored library call is the last write).
+// snapshot's own live protocols, backtests it against fourteen alternatives,
+// and writes the whole entry to the output directory: board.json, data.js,
+// the dashboard, the screenshots, and dossier.json last — the gate
+// re-derives the dossier byte-for-byte, so the vendored library call is the
+// last write and nothing after it touches the output tree.
 //
 // In the grader's container the snapshot is /input/snapshot.json and the
 // output is /output. Outside it:
 //
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json|dir>
 //
-// The program is fully deterministic: no clock, no randomness, no network.
-// Two runs over the same snapshot write identical bytes.
+// Fully deterministic: no clock, no randomness, no network. Two runs over
+// the same snapshot write identical bytes.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -59,7 +60,7 @@ mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(outDir, 'data.js'), dataScript(dash));
 
-/** Copy a directory tree of regular files, skipping dot-names, returning relative paths. */
+/** Copy a directory tree of regular files, skipping dot-names, in sorted order. */
 function copyTree(from: string, to: string, rel = ''): string[] {
   if (!existsSync(from)) return [];
   mkdirSync(to, { recursive: true });
@@ -89,8 +90,10 @@ for (const name of shots) {
 // Last write: the dossier, from the finished output tree.
 writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, { text_max_bytes: TEXT_CAP, screenshots: SHOT_CAPS, dashboard: DASH_CAPS }));
 
+const best = dash.candidates[0]!;
 process.stdout.write(
-  `launch-radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${board.length} board rows (${dash.early_size} early), ${dash.live_size} live shown apart\n` +
-    `launch-radar: fit log10(mcap) = ${dash.fit.intercept.toFixed(4)} + ${dash.fit.slope.toFixed(4)} * log10(TVL) on ${dash.fit.kept_count} live protocols (${dash.fit.trimmed_count} trimmed), R2 = ${dash.fit.r_squared}, LOO median error ${dash.backtest.median_pct}%\n` +
+  `launch-radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${board.length} board rows (${dash.meta.early_size} early), ${dash.live.length} live shown apart\n` +
+    `launch-radar: fit log10(mcap) = ${dash.model.intercept.toFixed(4)} + ${dash.model.slope.toFixed(4)} * log10(TVL) on ${dash.model.kept_count} live protocols (${dash.model.trimmed_count} trimmed), R2 = ${dash.model.r_squared}, LOO median error ${Math.round(dash.backtest.medianPct)}%\n` +
+    `launch-radar: bake-off winner by LOO MAE: ${best.name} (${best.summary.mae.toFixed(3)}); shipped spec MAE ${dash.backtest.mae.toFixed(3)}\n` +
     `launch-radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, dashboard (${dashFiles.length} files), screenshots (${shots.length}) and dossier.json\n`,
 );
