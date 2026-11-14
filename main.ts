@@ -1,7 +1,7 @@
-// Launch Radar: the token-radar-01 entrypoint (Node 22, standard library only).
+// Launch Radar v2: the token-radar-01 entrypoint (Node 22, standard library only).
 //
-// Reads the sealed snapshot, scores every pre-token protocol with the
-// snapshot-calibrated model in lib/model.ts, and writes the whole entry to
+// Reads the sealed snapshot, fits the power-law model in lib/model.ts to the
+// snapshot's own live protocols, backtests it, and writes the whole entry to
 // the output directory: board.json, data.js, the dashboard, the screenshots,
 // and dossier.json last (the gate re-derives it byte-for-byte, so the
 // vendored library call is the last write).
@@ -91,5 +91,6 @@ writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, { text_max_byte
 
 process.stdout.write(
   `launch-radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${board.length} board rows (${dash.early_size} early), ${dash.live_size} live shown apart\n` +
+    `launch-radar: fit log10(mcap) = ${dash.fit.intercept.toFixed(4)} + ${dash.fit.slope.toFixed(4)} * log10(TVL) on ${dash.fit.kept_count} live protocols (${dash.fit.trimmed_count} trimmed), R2 = ${dash.fit.r_squared}, LOO median error ${dash.backtest.median_pct}%\n` +
     `launch-radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, dashboard (${dashFiles.length} files), screenshots (${shots.length}) and dossier.json\n`,
 );
