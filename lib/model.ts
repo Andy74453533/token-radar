@@ -1,4 +1,4 @@
-// Launch Radar v3: the token-radar-01 model, backtest, board and farm plans.
+// Launch Radar v4: the token-radar-01 model, backtest, board and farm plans.
 //
 // The valuation is a power law fitted to the snapshot's own live protocols
 // (those whose token already trades): log10(market cap) against log10(TVL),
@@ -6,12 +6,25 @@
 // with a prior of 12. Two small bounded adjustments follow the snapshot's
 // own figures: seven-day TVL growth (clamped, weight 0.15) and how long the
 // protocol has run (seasoning of at most 5% over three years). Every choice
-// below was picked by leave-one-out backtest against fourteen alternatives
-// (see bakeOff); richer fits — joint regression, per-category slopes, kNN,
-// ensembles — did not beat this specification, so they were not shipped.
-// Uncertainty is honest: each row carries a 50% and an 80% interval taken
-// from the backtest's own residual quantiles, so the board shows what the
-// fit does not know.
+// below was picked by leave-one-out backtest against twenty-seven
+// alternatives (see bakeOff); richer fits — joint regression, per-category
+// slopes, kNN, ensembles — and every trim, shrinkage, growth and seasoning
+// variant did not beat this specification, so none of them shipped. The
+// bake-off reports a paired t-test of each alternative against the shipped
+// specification, so "no better" is evidence, not an assertion. Uncertainty
+// is honest: each row carries a 50% and an 80% interval taken from the
+// backtest's own residual quantiles, so the board shows what the fit does
+// not know.
+//
+// The board ranks every watchlist protocol plus every remaining pre-token
+// protocol that is not a wrapped, staked or bridged product under the house
+// rule's category, wrapped-word and exchange-prefix tests. A trailing
+// version marker alone does not exclude a protocol: a V2 deployment is the
+// protocol's current version, not a wrapped product — but when two versions
+// of one family both qualify, only the larger TVL is ranked, so no family
+// is counted twice. Protocols that record a token symbol or id but no
+// market cap are neither ranked nor used to calibrate the curve: their
+// tokens trade, the snapshot just carries no price for them.
 //
 // Deterministic throughout: no clock, no randomness, no network. Sorted
 // iteration everywhere; the same snapshot always writes the same bytes.
@@ -554,14 +567,82 @@ export interface CandidateResult {
   name: string;
   shipped: boolean;
   summary: ErrorSummary;
+  /** Paired t-statistic of |error| against the shipped specification over
+      the same folds: negative means the candidate errs less, positive means
+      it errs more; null for the shipped row itself. |t| under 2 is noise. */
+  pairedT: number | null;
 }
 
-/**
- * The model bake-off: fifteen specifications, each leave-one-out backtested
- * on the same live set. The shipped row is fixed by SPEC, not picked at run
- * time; the table exists so the choice can be checked, not re-decided.
- */
-export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
+/** The fitted log value with growth weight and seasoning amplitude as
+    knobs, so the bake-off can test ablations and weight variants as honest
+    refits. The shipped path never calls this: it uses predictLog and SPEC. */
+function predictLogWith(fit: Fit, p: Proto, asOfMs: number, growthW: number, ageAmp: number): number {
+  const offset = fit.offsets.get(catKey(p)) ?? 0;
+  return (
+    fit.intercept +
+    fit.slope * LOG(p.tvl_usd) +
+    offset +
+    LOG(1 + growthFrac(p) * growthW) +
+    LOG(1 + ageAmp * (ageFrac(p, asOfMs) - 0.5))
+  );
+}
+
+function paramPredictor(
+  train: Proto[],
+  asOfMs: number,
+  opts: { prior?: number; trimSd?: number; rounds?: number; growthW?: number; ageAmp?: number } = {},
+): Predictor {
+  const fit = fitPowerLaw(train, opts.prior ?? SPEC.shrinkPrior, opts.trimSd ?? SPEC.trimSd, opts.rounds ?? SPEC.trimRounds);
+  const growthW = opts.growthW ?? SPEC.growthWeight;
+  const ageAmp = opts.ageAmp ?? SPEC.ageAmp;
+  return (p: Proto) => predictLogWith(fit, p, asOfMs, growthW, ageAmp);
+}
+
+/** Median-residual category offsets instead of mean-residual ones: the
+    robust alternative to the shipped shrinkage, tested and rejected. */
+function medianOffsetPredictor(train: Proto[], asOfMs: number): Predictor {
+  let use = train;
+  let a = 0;
+  let b = 0;
+  for (let round = 0; round <= SPEC.trimRounds; round++) {
+    [a, b] = ols2(
+      use.map((p) => LOG(p.tvl_usd)),
+      use.map((p) => LOG(p.mcap_usd!)),
+    );
+    if (round === SPEC.trimRounds) break;
+    const res = use.map((p) => LOG(p.mcap_usd!) - (a + b * LOG(p.tvl_usd)));
+    const sd = Math.sqrt(res.reduce((s, v) => s + v * v, 0) / res.length);
+    use = use.filter((_, i) => Math.abs(res[i]!) <= SPEC.trimSd * sd);
+  }
+  const groups = new Map<string, number[]>();
+  for (const p of use) {
+    const k = catKey(p);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(LOG(p.mcap_usd!) - (a + b * LOG(p.tvl_usd)));
+  }
+  const offsets = new Map<string, number>();
+  for (const [k, rs] of groups) {
+    const s = [...rs].sort((x, y) => x - y);
+    const med = s.length % 2 === 1 ? s[(s.length - 1) / 2]! : (s[s.length / 2 - 1]! + s[s.length / 2]!) / 2;
+    offsets.set(k, med * (rs.length / (rs.length + SPEC.shrinkPrior)));
+  }
+  return (p: Proto) => {
+    const offset = offsets.get(catKey(p)) ?? 0;
+    return a + b * LOG(p.tvl_usd) + offset + LOG(1 + growthFrac(p) * SPEC.growthWeight) + LOG(1 + SPEC.ageAmp * (ageFrac(p, asOfMs) - 0.5));
+  };
+}
+
+export interface HarderSplitRow {
+  name: string;
+  shipped: boolean;
+  loo_mae: number;
+  loco_mae: number;
+  band_mae: number;
+}
+
+/** The bake-off specification list, shared by bakeOff and harderSplits so
+    both judge exactly the same fits. */
+export function candidateSpecs(asOfMs: number): { name: string; shipped: boolean; fn: FitFn }[] {
   const noOffsets = (train: Proto[]): Predictor => {
     const fit = fitPowerLaw(train, 1e12, SPEC.trimSd, SPEC.trimRounds);
     return (p: Proto) => predictLog(fit, p, asOfMs).logValue;
@@ -574,10 +655,23 @@ export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
   const candidates: { name: string; shipped: boolean; fn: FitFn }[] = [
     { name: 'Power law + shrunk offsets (prior 12) — shipped', shipped: true, fn: (t) => powerLawPredictor(t, asOfMs) },
     { name: 'Power law + offsets, prior 6', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, 6) },
+    { name: 'Power law + offsets, prior 8', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 8 }) },
+    { name: 'Power law + offsets, prior 16', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 16 }) },
     { name: 'Power law + offsets, prior 20', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, 20) },
+    { name: 'Power law + offsets, prior 24', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 24 }) },
     { name: 'Power law, trim 1.5 SD', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1.5) },
+    { name: 'Power law, trim 2.5 SD', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { trimSd: 2.5 }) },
+    { name: 'Power law, trim 2 rounds', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { rounds: 2 }) },
     { name: 'Power law, no trim', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1e9, 0) },
     { name: 'Power law, no category offsets', shipped: false, fn: noOffsets },
+    { name: 'Power law, median category offsets', shipped: false, fn: (t) => medianOffsetPredictor(t, asOfMs) },
+    { name: 'Power law, growth weight 0.10', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.1 }) },
+    { name: 'Power law, growth weight 0.20', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.2 }) },
+    { name: 'Power law, no growth factor', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0 }) },
+    { name: 'Power law, seasoning amp 0.05', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.05 }) },
+    { name: 'Power law, seasoning amp 0.15', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.15 }) },
+    { name: 'Power law, no seasoning factor', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0 }) },
+    { name: 'Power law, no growth or seasoning', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0, ageAmp: 0 }) },
     { name: 'Joint OLS: TVL + growth + age + chains', shipped: false, fn: (t) => jointOlsPredictor(t, asOfMs) },
     { name: 'Per-category slopes, shrunk', shipped: false, fn: (t) => catSlopesPredictor(t, asOfMs) },
     { name: 'Quadratic in log TVL', shipped: false, fn: (t) => quadraticPredictor(t, asOfMs) },
@@ -588,8 +682,57 @@ export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
     { name: 'Huber robust line', shipped: false, fn: (t) => huberPredictor(t, asOfMs) },
     { name: 'Naive: median mcap/TVL ratio', shipped: false, fn: naivePredictor },
   ];
-  const results = candidates.map((c) => ({ name: c.name, shipped: c.shipped, summary: summarizeErrors(looErrors(c.fn, live)) }));
+  return candidates;
+}
+
+/**
+ * The model bake-off: twenty-eight specifications, each leave-one-out
+ * backtested on the same live set, each compared to the shipped
+ * specification by a paired t-test over the same folds. The shipped row is
+ * fixed by SPEC, not picked at run time; the table exists so the choice can
+ * be checked, not re-decided.
+ */
+export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
+  const candidates = candidateSpecs(asOfMs);
+  const shippedFn = candidates.find((c) => c.shipped)!.fn;
+  const shippedAbs = looErrors(shippedFn, live).map(Math.abs);
+  const results = candidates.map((c) => {
+    const errs = looErrors(c.fn, live);
+    const summary = summarizeErrors(errs);
+    let pairedT: number | null = null;
+    if (!c.shipped) {
+      const d = errs.map((e, i) => Math.abs(e) - shippedAbs[i]!);
+      const n = d.length;
+      const mean = d.reduce((s, v) => s + v, 0) / n;
+      const sd = Math.sqrt(d.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1));
+      pairedT = sd === 0 ? 0 : Math.round((mean / (sd / Math.sqrt(n))) * 100) / 100;
+    }
+    return { name: c.name, shipped: c.shipped, summary, pairedT };
+  });
   return results.sort((a, b) => a.summary.mae - b.summary.mae || (a.name < b.name ? -1 : 1));
+}
+
+/**
+ * The harder splits for the five closest specifications plus the shipped
+ * one: a LOO leader that only wins by memorising its own category or size
+ * band falls behind here, and the research note shows the numbers.
+ */
+export function harderSplits(live: Proto[], asOfMs: number, candidates: CandidateResult[]): HarderSplitRow[] {
+  const specs = new Map(candidateSpecs(asOfMs).map((c) => [c.name, c]));
+  const picked = candidates
+    .slice(0, 5)
+    .concat(candidates.filter((c) => c.shipped))
+    .filter((c, i, arr) => arr.findIndex((x) => x.name === c.name) === i);
+  return picked.map((c) => {
+    const fn = specs.get(c.name)!.fn;
+    return {
+      name: c.name,
+      shipped: c.shipped,
+      loo_mae: c.summary.mae,
+      loco_mae: summarizeErrors(locoErrors(fn, live)).mae,
+      band_mae: summarizeErrors(bandHoldoutErrors(fn, live)).mae,
+    };
+  });
 }
 
 /** Leave-one-category-out: hold out each category whole, predict it cold. */
@@ -660,6 +803,9 @@ export interface Comparable {
   same_category: boolean;
   fitted_value_usd: number;
   error_factor: number;
+  /** True when the trim dropped this protocol before the final fit: its
+      ratio was too extreme to let bend the curve, so its gap is expected. */
+  trimmed: boolean;
 }
 
 /**
@@ -687,6 +833,7 @@ export function comparables(fit: Fit, live: Proto[], target: Proto, asOfMs: numb
     seen.add(r.p.slug);
   }
   picked.sort((a, b) => a.d - b.d || (a.p.slug < b.p.slug ? -1 : 1));
+  const trimmedSet = new Set(fit.trimmedSlugs);
   return picked.map(({ p }) => {
     const fitted = impliedValue(fit, p, asOfMs);
     return {
@@ -698,6 +845,7 @@ export function comparables(fit: Fit, live: Proto[], target: Proto, asOfMs: numb
       same_category: catKey(p) === catKey(target),
       fitted_value_usd: fitted,
       error_factor: Math.round((p.mcap_usd! / Math.max(1, fitted)) * 100) / 100,
+      trimmed: trimmedSet.has(p.slug),
     };
   });
 }
@@ -710,23 +858,45 @@ const VERSION_TAIL = /\s(v\d+(\.\d+)*|\d+\.\d+(\.\d+)*)$/i;
 const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
 
 /**
- * The house rule's wrapped / staked / bridged test, from RULES.txt: the
+ * The house rule's wrapped / staked / bridged tests, from RULES.txt: the
  * category is a bridge, staking or exchange product, the name ends in a
  * version marker, carries a whole word wrapped/staked/staking, or begins
- * with an exchange's name. The watchlist already applies it; the early set
- * applies it too, so the board never ranks a wrapped product as a launch.
+ * with an exchange's name. The watchlist applies all four. The early set
+ * applies the first three in full — a wrapped product is never ranked as a
+ * launch — but a version marker alone does not exclude a protocol: a V2
+ * deployment is the protocol's current version, not a wrapped product of a
+ * token that trades. Versioned families are deduplicated instead (see
+ * baseName): only the largest version of a family is ranked.
  */
 export function looksWrapped(p: Proto): boolean {
   if (WRAPPED_CATEGORIES.has(p.category ?? '')) return true;
-  if (VERSION_TAIL.test(p.name)) return true;
   if (WRAPPED_WORD.test(p.name)) return true;
   if (EXCHANGE_PREFIX.test(p.name)) return true;
   return false;
 }
 
+/** True when the name ends in a version marker (a space, then V2, 2.0…). */
+export function hasVersionTail(p: Proto): boolean {
+  return VERSION_TAIL.test(p.name);
+}
+
+/** The name with a trailing version marker stripped: the protocol family. */
+export function baseName(p: Proto): string {
+  return p.name.replace(VERSION_TAIL, '');
+}
+
 /** A protocol records no token when the snapshot carries no cap, id or symbol. */
 export function recordsNoToken(p: Proto): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
+}
+
+/**
+ * A partial token record: the snapshot carries a CoinGecko id or a symbol
+ * but no market cap. The token trades — the record just carries no price —
+ * so these protocols are neither ranked nor used to calibrate the curve.
+ */
+export function recordsPartialToken(p: Proto): boolean {
+  return p.mcap_usd === null && (p.gecko_id !== null || p.symbol !== null);
 }
 
 /** A live protocol: a positive market cap and a positive TVL. */
@@ -772,6 +942,23 @@ export interface LiveRow {
   error_factor: number;
 }
 
+export interface CompositionAudit {
+  /** Pre-token protocols in the snapshot (no cap, id or symbol). */
+  pre_token_total: number;
+  /** Pre-token protocols excluded by each house-rule test (a protocol can hit several). */
+  excluded_category: number;
+  excluded_wrapped_word: number;
+  excluded_exchange_prefix: number;
+  /** Version-tailed protocols admitted to the early set under the family rule. */
+  version_tail_admitted: number;
+  /** Version-tailed protocols dropped as the smaller version of a family. */
+  version_tail_deduped: string[];
+  /** Protocols recording a token id or symbol but no market cap: neither ranked nor calibrating. */
+  partial_token_records: number;
+  /** Live protocols with a market cap at or below zero: not calibrating. */
+  nonpositive_mcap: number;
+}
+
 export interface DashData {
   meta: {
     as_of: string;
@@ -808,7 +995,9 @@ export interface DashData {
     band_holdout: ErrorSummary;
   };
   candidates: CandidateResult[];
+  harder_splits: HarderSplitRow[];
   calibration: CalibrationRow[];
+  composition: CompositionAudit;
   rows: BoardRow[];
   live: LiveRow[];
   scatter: { slug: string; name: string; category: string; x: number; y: number; trimmed: boolean }[];
@@ -860,6 +1049,35 @@ const NON_EVM_WALLETS: Record<string, string> = {
 
 function walletFamily(chain: string): string {
   return NON_EVM_WALLETS[chain] ?? 'an EVM wallet';
+}
+
+// Gas wording follows the protocol's first chain, because a dollar of gas
+// means different things in different places: Ethereum mainnet is the only
+// chain where a DeFi interaction routinely costs dollars, most other chains
+// charge under a dollar, and the fast non-EVM chains charge cents. The
+// branch templates carry generic gas phrases; gasAdjust rewrites them to
+// the chain's tier after filling, so every step's cost stays concrete.
+const CHEAP_FEE_CHAINS = new Set([
+  'Solana', 'Sui', 'Aptos', 'Tron', 'TON', 'Cardano', 'Near', 'Cosmos', 'Osmosis',
+  'Injective', 'Sei', 'Celestia', 'Kava', 'Terra', 'dYdX', 'Canton', 'Proton',
+  'PlatON', 'Noble', 'Bitcoincash', 'Stellar', 'Ripple', 'Algorand', 'Zcash',
+  'Doge', 'Litecoin', 'XION', 'Aleo',
+]);
+
+function gasPhrases(chain: string): { standard: string; exit: string } {
+  if (chain === 'Ethereum') return { standard: 'about $3–12 of gas', exit: 'about $3–10' };
+  if (CHEAP_FEE_CHAINS.has(chain)) return { standard: 'a few cents of fees', exit: 'a few cents' };
+  return { standard: 'under $1 of gas', exit: 'under $1' };
+}
+
+/** Rewrite a step's generic gas phrases to the first chain's tier. Bridge
+    and payment fees are the protocol's own charges, not gas, and are left
+    exactly as the branch wrote them. */
+function gasAdjust(step: string, chain: string): string {
+  const { standard, exit } = gasPhrases(chain);
+  return step
+    .replace(/about \$[0-9–-]+ of gas/g, standard)
+    .replace(/exit gas, about \$[0-9–-]+/g, `exit gas, ${exit}`);
 }
 
 /** A deterministic pick from variants, so plans differ without randomness. */
@@ -1212,7 +1430,15 @@ export function farmPlan(p: Proto, asOfMs: number): string[] {
     holdStep(asOfMs, p.slug, ageDays(p, asOfMs)),
     closeStep(p.slug),
   ];
-  return steps.map(fitStep);
+  // A fast-growing protocol gets a sizing caution in its open step, placed
+  // before the cost sentence: momentum is when oversizing hurts most.
+  if (p.change_7d !== null && p.change_7d >= 30 && steps[2]!.includes(' Cost: ')) {
+    steps[2] = steps[2]!.replace(
+      ' Cost: ',
+      ` TVL jumped ${p.change_7d.toFixed(1)}% in a week — start at the small end of the size range and add only after a week of watching it hold. Cost: `,
+    );
+  }
+  return steps.map((s) => fitStep(gasAdjust(s, chain1)));
 }
 
 // ---------------------------------------------------------------- build
@@ -1225,7 +1451,8 @@ export interface Built {
 /**
  * Fit, backtest, bake off, and rank. The board is every watchlist protocol
  * plus every remaining pre-token protocol that is not a wrapped, staked or
- * bridged product — 198 rows on this snapshot — ranked by implied value.
+ * bridged product under the category, wrapped-word and exchange-prefix
+ * tests, with versioned families deduplicated to their largest version.
  */
 export function buildAll(snap: Snap): Built {
   const asOfMs = Date.parse(`${snap.as_of}T00:00:00Z`);
@@ -1240,11 +1467,31 @@ export function buildAll(snap: Snap): Built {
   const loco = summarizeErrors(locoErrors(shipped, live));
   const bandHoldout = summarizeErrors(bandHoldoutErrors(shipped, live));
   const candidates = bakeOff(live, asOfMs);
+  const splits = harderSplits(live, asOfMs, candidates);
   const calibration = calibrationTable(live, fit, looErrs);
 
   const watchSet = new Set(snap.watchlist);
+  // Early candidates: pre-token, passing the three wrapped-product tests.
+  // Version-tailed names stay in; families are deduplicated below.
+  const early = snap.protocols
+    .filter((p) => recordsNoToken(p) && !watchSet.has(p.slug) && !looksWrapped(p))
+    .sort((a, b) => (a.slug < b.slug ? -1 : 1));
+  // Family dedupe: when several versions of one base name qualify, keep
+  // only the largest TVL, so no family is ranked twice. Watchlist rows are
+  // never deduped (none carries a version tail under the house rule).
+  const bestByFamily = new Map<string, Proto>();
+  const deduped: string[] = [];
+  for (const p of early) {
+    const base = baseName(p);
+    const cur = bestByFamily.get(base);
+    if (cur === undefined) bestByFamily.set(base, p);
+    else if (p.tvl_usd > cur.tvl_usd) {
+      deduped.push(cur.slug);
+      bestByFamily.set(base, p);
+    } else deduped.push(p.slug);
+  }
   const boardProtocols = snap.protocols
-    .filter((p) => recordsNoToken(p) && (watchSet.has(p.slug) || !looksWrapped(p)))
+    .filter((p) => watchSet.has(p.slug) || bestByFamily.get(baseName(p)) === p)
     .sort((a, b) => (a.slug < b.slug ? -1 : 1));
   const scored = boardProtocols.map((p) => {
     const { logValue, breakdown } = predictLog(fit, p, asOfMs);
@@ -1320,6 +1567,21 @@ export function buildAll(snap: Snap): Built {
       live_count: fit.liveInCategory.get(category) ?? 0,
     }));
 
+  // The composition audit: what the board left out, and why, counted from
+  // the snapshot itself so the research note reports facts, not claims.
+  const preToken = snap.protocols.filter(recordsNoToken);
+  const nonWatchPre = preToken.filter((p) => !watchSet.has(p.slug));
+  const composition: CompositionAudit = {
+    pre_token_total: preToken.length,
+    excluded_category: nonWatchPre.filter((p) => WRAPPED_CATEGORIES.has(p.category ?? '')).length,
+    excluded_wrapped_word: nonWatchPre.filter((p) => WRAPPED_WORD.test(p.name)).length,
+    excluded_exchange_prefix: nonWatchPre.filter((p) => EXCHANGE_PREFIX.test(p.name)).length,
+    version_tail_admitted: board.filter((r) => VERSION_TAIL.test(r.name)).length,
+    version_tail_deduped: deduped.sort(),
+    partial_token_records: snap.protocols.filter(recordsPartialToken).length,
+    nonpositive_mcap: snap.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd <= 0).length,
+  };
+
   const dash: DashData = {
     meta: {
       as_of: snap.as_of,
@@ -1351,7 +1613,9 @@ export function buildAll(snap: Snap): Built {
     },
     backtest: { ...summary, bands, histogram, loco, band_holdout: bandHoldout },
     candidates,
+    harder_splits: splits,
     calibration,
+    composition,
     rows: board,
     live: liveRows,
     scatter,
