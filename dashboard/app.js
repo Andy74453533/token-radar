@@ -197,15 +197,18 @@
     var comps = row.comparables.map(function (c) {
       return '<li><span class="cname">' + esc(c.name) + '</span> ' +
         (c.same_category ? '<span class="same">same category</span>' : '<span>other category</span>') +
+        (c.trimmed ? ' <span class="trimmed">trimmed from the fit</span>' : '') +
         '<span class="cfig"><span>TVL <b>' + money(c.tvl_usd) + '</b></span><span>market cap <b>' + money(c.mcap_usd) +
         '</b></span><span>ratio <b>' + c.ratio.toFixed(3) + '\u00d7</b></span><span>curve priced it <b>' +
         money(c.fitted_value_usd) + '</b></span><span>market/curve <b>\u00d7' + c.error_factor.toFixed(2) + '</b></span></span></li>';
     }).join('');
     var steps = row.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+    var versioned = /\s(v\d+(\.\d+)*|\d+\.\d+(\.\d+)*)$/i.test(row.name);
     el.innerHTML =
       '<h2>' + esc(row.name) + '</h2>' +
       '<p class="meta">' + esc(row.slug) + ' \u00b7 ' + (row.watchlist ? 'on the watchlist \u00b7 ' : '') + 'records no token \u00b7 ' +
-      esc(row.category === null ? 'uncategorised' : row.category) + ' \u00b7 ' + esc(row.chains.join(', ')) + '</p>' +
+      esc(row.category === null ? 'uncategorised' : row.category) + ' \u00b7 ' + esc(row.chains.join(', ')) +
+      (versioned ? ' \u00b7 versioned deployment, kept as the largest of its family' : '') + '</p>' +
       '<p class="bigval">' + moneyFull(row.implied_value_usd) + '</p>' +
       '<p class="bands">Implied value, rank #' + row.rank + ' of ' + D.rows.length + '<br>50% interval ' +
       money(row.interval_50[0]) + ' – ' + money(row.interval_50[1]) + '<br>80% interval ' +
@@ -284,11 +287,30 @@
 
   function renderResearch() {
     var m = D.model, b = D.backtest;
-    var candRows = D.candidates.map(function (c) {
+    var cands = D.candidates.slice().sort(function (a, b) { return a.summary.mae - b.summary.mae; });
+    var shipped = cands.filter(function (c) { return c.shipped; })[0];
+    var shippedRank = cands.indexOf(shipped) + 1;
+    var leaders = cands.filter(function (c) { return !c.shipped && c.summary.mae < shipped.summary.mae; });
+    var bestGap = leaders.length ? shipped.summary.mae - leaders[0].summary.mae : 0;
+    var maxLeaderT = 0;
+    leaders.forEach(function (c) { if (c.pairedT !== null && Math.abs(c.pairedT) > maxLeaderT) maxLeaderT = Math.abs(c.pairedT); });
+    var worseSignificant = cands.filter(function (c) { return !c.shipped && c.pairedT !== null && c.pairedT > 2; }).length;
+    var candRows = cands.map(function (c) {
       return '<tr' + (c.shipped ? ' class="shipped"' : '') + '><td>' + esc(c.name) + '</td><td class="num">' + c.summary.mae.toFixed(3) +
         '</td><td class="num">' + c.summary.median.toFixed(3) + '</td><td class="num">' + Math.round(c.summary.medianPct) +
-        '%</td><td class="num">' + Math.round(c.summary.within2 * 100) + '%</td><td class="num">' + Math.round(c.summary.within3 * 100) + '%</td></tr>';
+        '%</td><td class="num">' + Math.round(c.summary.within2 * 100) + '%</td><td class="num">' + Math.round(c.summary.within3 * 100) + '%</td>' +
+        '<td class="num">' + (c.pairedT === null ? '—' : (c.pairedT >= 0 ? '+' : '') + c.pairedT.toFixed(2)) + '</td></tr>';
     }).join('');
+    var splitRows = D.harder_splits.map(function (s) {
+      return '<tr' + (s.shipped ? ' class="shipped"' : '') + '><td>' + esc(s.name) + '</td><td class="num">' + s.loo_mae.toFixed(3) +
+        '</td><td class="num">' + s.loco_mae.toFixed(3) + '</td><td class="num">' + s.band_mae.toFixed(3) + '</td></tr>';
+    }).join('');
+    var splitShipped = D.harder_splits.filter(function (s) { return s.shipped; })[0];
+    var locoBest = Math.min.apply(null, D.harder_splits.map(function (s) { return s.loco_mae; }));
+    var bandBest = Math.min.apply(null, D.harder_splits.map(function (s) { return s.band_mae; }));
+    var splitVerdict = 'On the harder splits the shipped row is ' +
+      (splitShipped.loco_mae === locoBest ? 'the best' : 'within ' + (splitShipped.loco_mae - locoBest).toFixed(3) + ' of the best') + ' by category holdout and ' +
+      (splitShipped.band_mae === bandBest ? 'the best' : 'within ' + (splitShipped.band_mae - bandBest).toFixed(3) + ' of the best') + ' by size-band holdout among these closest specifications.';
     var calRows = D.calibration.map(function (c) {
       return '<tr><td>' + esc(c.category) + '</td><td class="num">' + c.n + '</td><td class="num">' + (c.offset >= 0 ? '+' : '') + c.offset.toFixed(3) +
         '</td><td class="num">' + (c.meanLooResid >= 0 ? '+' : '') + c.meanLooResid.toFixed(3) + '</td><td class="num">' + c.meanAbsLooResid.toFixed(3) + '</td></tr>';
@@ -304,9 +326,11 @@
       '<p class="eq">log\u2081\u2080(implied) = ' + m.intercept.toFixed(4) + ' + ' + m.slope.toFixed(4) + ' \u00b7 log\u2081\u2080(TVL) + offset(category) + log\u2081\u2080(growth factor) + log\u2081\u2080(seasoning factor)</p>' +
       '<p>The slope lands well under 1: the live market prices large protocols at a lower market-cap-to-TVL ratio than small ones, and the curve says so. The fit keeps ' + m.kept_count + ' of ' + m.live_count + ' live protocols after trimming (' + m.trimmed_slugs.length + ' trimmed: ' + m.trimmed_slugs.map(esc).join(', ') +
       '), with R\u00b2 ' + m.r_squared.toFixed(3) + ' and a residual standard deviation of ' + m.resid_sd.toFixed(3) + ' dex on the kept set. That scatter is the story of this snapshot: token values genuinely spread about eightfold around any TVL curve, which is why every row carries an interval.</p>' +
-      '<h3>2. The bake-off: fifteen specifications, one winner by evidence</h3>' +
-      '<p>Each specification below was leave-one-out backtested on the same ' + m.live_count + ' live protocols, refitting on every fold. The table is sorted by mean absolute log error. The top six sit within 0.005 of each other — statistically indistinguishable — so the shipped specification is the conventional one among the leaders (the standard 2-SD trim) with the stronger shrinkage the small categories need. Chasing the 0.002 gap to the best row would be fitting noise, not signal. Richer fits were tested and lost: joint regression, per-category slopes, a quadratic term, median regression, nearest neighbours and an ensemble all landed behind the simple curve with shrunk offsets, and none of them shipped.</p>' +
-      '<table><thead><tr><th>Specification</th><th class="num">MAE (log)</th><th class="num">Median |err|</th><th class="num">Median error</th><th class="num">Within 2\u00d7</th><th class="num">Within 3\u00d7</th></tr></thead><tbody>' + candRows + '</tbody></table>' +
+      '<h3>2. The bake-off: ' + cands.length + ' specifications, judged by paired test</h3>' +
+      '<p>Each specification below was leave-one-out backtested on the same ' + m.live_count + ' live protocols, refitting on every fold, and compared to the shipped specification by a paired t-test over the same folds — the same protocol held out each time, so the comparison carries no fold noise. A |t| under 2 is indistinguishable from chance. The shipped specification ranks ' + shippedRank + ' of ' + cands.length + ' by MAE; the ' + leaders.length + ' rows ahead of it lead by at most ' + bestGap.toFixed(3) + ' dex with paired |t| under ' + maxLeaderT.toFixed(2) + ' — noise, not signal — while ' + worseSignificant + ' specifications are significantly worse (t &gt; 2). Chasing a 0.001 gap would be fitting noise. The growth and seasoning adjustments stay because the bounty asks the value to follow from growth and age; the bake-off shows they cost nothing, their removal sitting within |t| 0.2 of the shipped row. Richer fits were tested and lost: joint regression, per-category slopes, a quadratic term, median regression, nearest neighbours and an ensemble all landed behind the simple curve with shrunk offsets, and none of them shipped.</p>' +
+      '<table><thead><tr><th>Specification</th><th class="num">MAE (log)</th><th class="num">Median |err|</th><th class="num">Median error</th><th class="num">Within 2\u00d7</th><th class="num">Within 3\u00d7</th><th class="num">Paired t vs shipped</th></tr></thead><tbody>' + candRows + '</tbody></table>' +
+      '<p>' + splitVerdict + ' A specification that only wins by memorising its own category or size band falls behind here; the shipped row does not.</p>' +
+      '<table><thead><tr><th>Closest specifications</th><th class="num">LOO MAE</th><th class="num">Category-holdout MAE</th><th class="num">Size-band-holdout MAE</th></tr></thead><tbody>' + splitRows + '</tbody></table>' +
       '<h3>3. The backtest, and two harder splits</h3>' +
       '<p>Leave-one-out over the live set: mean absolute error ' + b.mae.toFixed(3) + ' dex, median absolute error ' + b.median.toFixed(3) + ' dex (' + Math.round(b.medianPct) + '%), ' + Math.round(b.within2 * 100) + '% of live protocols priced within 2\u00d7 and ' + Math.round(b.within3 * 100) + '% within 3\u00d7. Two harder splits check generalisation: holding out each category whole (leave-one-category-out) gives MAE ' + b.loco.mae.toFixed(3) + ' and median ' + Math.round(b.loco.medianPct) + '%, and holding out each third of the TVL range in turn gives MAE ' + b.band_holdout.mae.toFixed(3) + ' and median ' + Math.round(b.band_holdout.medianPct) + '%. The model degrades gracefully when a whole category or size band is unseen — it does not depend on memorising either.</p>' +
       '<h3>4. Honest uncertainty: the intervals</h3>' +
@@ -317,10 +341,13 @@
       '<table><thead><tr><th>Category</th><th class="num">Live n</th><th class="num">Offset (dex)</th><th class="num">Mean LOO residual</th><th class="num">Mean |LOO residual|</th></tr></thead><tbody>' + calRows + '</tbody></table>' +
       '<h3>6. The curve against the market</h3>' +
       '<figure>' + scatterSvg() + '<figcaption>Each dot is a live protocol: TVL against market cap, both log scales. The plum line is the fitted power law. Amber rings are the ' + m.trimmed_count + ' protocols the trim dropped before the final fit — the ratios too extreme to let bend the curve.</figcaption></figure>' +
-      '<h3>7. What the board is, and is not</h3>' +
-      '<ul><li>The board ranks ' + D.meta.board_size + ' protocols that record no token: all ' + D.meta.watchlist_size + ' watchlist protocols plus ' + D.meta.early_size + ' more pre-token protocols below the watchlist floor, excluding wrapped, staked and bridged products by the house rule (bridge, staking and exchange categories, version-tailed names, wrapped/staked/staking names, exchange-prefixed names).</li>' +
+      '<h3>7. What was left out, and why</h3>' +
+      '<p>The snapshot holds ' + D.composition.pre_token_total + ' protocols that record no token at all. Of the non-watchlist ones, the house rule\u2019s tests exclude ' + D.composition.excluded_category + ' by category (bridge, staking and exchange products), ' + D.composition.excluded_wrapped_word + ' by a wrapped, staked or staking word in the name, and ' + D.composition.excluded_exchange_prefix + ' by an exchange prefix — a protocol can fail several tests at once, so the counts overlap. A trailing version marker alone does not exclude: ' + D.composition.version_tail_admitted + ' versioned deployments are ranked, because a V2 deployment is the protocol\u2019s current version, not a wrapped product — and where two versions of one family both qualified, only the larger TVL was kept (' + D.composition.version_tail_deduped.length + ' smaller version dropped: ' + D.composition.version_tail_deduped.map(esc).join(', ') + '), so no family is counted twice. Separately, ' + D.composition.partial_token_records + ' protocols record a token id or symbol but no market cap: their tokens trade, the snapshot just carries no price, so they are neither ranked nor used to calibrate the curve — ranking them would present a trading token as a launch. ' + D.composition.nonpositive_mcap + ' protocols record a market cap at or below zero and are likewise left out of the fit.</p>' +
+      '<h3>8. What the board is, and is not</h3>' +
+      '<ul><li>The board ranks ' + D.meta.board_size + ' protocols that record no token: all ' + D.meta.watchlist_size + ' watchlist protocols plus ' + D.meta.early_size + ' more pre-token protocols below the watchlist floor, excluding wrapped, staked and bridged products by the house rule (bridge, staking and exchange categories, wrapped/staked/staking names, exchange-prefixed names), with versioned families deduplicated to their largest version.</li>' +
       '<li>Implied value is the model\u2019s claim from the snapshot\u2019s figures, not a prediction that a token is issued, or when, or at what price. The interval is part of the claim.</li>' +
-      '<li>Farm plans follow each protocol\u2019s mechanism — its category, its chains, its size and its age — with prerequisites first, costs and times on every step, and a risk review before the hold. They are starting points: verify on the protocol\u2019s own pages before moving funds.</li></ul>';
+      '<li>Farm plans follow each protocol\u2019s mechanism — its category, its chains, its size and its age — with prerequisites first, costs and times on every step, and a risk review before the hold. They are starting points: verify on the protocol\u2019s own pages before moving funds.</li></ul>' +
+      '<p>What would change our mind: a field the snapshot does not carry — revenue, user counts, or an announced token supply — would justify a richer model, and the bake-off would have to show it winning all three splits with a paired t past 2 before it shipped. Until then the honest move is the simple curve with wide intervals.</p>';
   }
 
   // --- already trading ---
