@@ -1,11 +1,12 @@
-// Launch Radar v3: the token-radar-01 entrypoint (Node 22, standard library only).
+// Launch Radar v4: the token-radar-01 entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, fits the power-law model in lib/model.ts to the
-// snapshot's own live protocols, backtests it against fourteen alternatives,
-// and writes the whole entry to the output directory: board.json, data.js,
-// the dashboard, the screenshots, and dossier.json last — the gate
-// re-derives the dossier byte-for-byte, so the vendored library call is the
-// last write and nothing after it touches the output tree.
+// snapshot's own live protocols, backtests it against twenty-seven
+// alternatives with paired t-tests, and writes the whole entry to the output
+// directory: board.json, data.js, the dashboard, the screenshots, and
+// dossier.json last — the gate re-derives the dossier byte-for-byte, so the
+// vendored library call is the last write and nothing after it touches the
+// output tree.
 //
 // In the grader's container the snapshot is /input/snapshot.json and the
 // output is /output. Outside it:
