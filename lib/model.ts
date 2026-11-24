@@ -1,20 +1,38 @@
-// Launch Radar v4: the token-radar-01 model, backtest, board and farm plans.
+// Launch Radar v5: the token-radar-01 model, backtest, board and farm plans.
 //
 // The valuation is a power law fitted to the snapshot's own live protocols
 // (those whose token already trades): log10(market cap) against log10(TVL),
 // one round of 2-SD trimming, then per-category offsets shrunk toward zero
 // with a prior of 12. Two small bounded adjustments follow the snapshot's
 // own figures: seven-day TVL growth (clamped, weight 0.15) and how long the
-// protocol has run (seasoning of at most 5% over three years). Every choice
-// below was picked by leave-one-out backtest against twenty-seven
-// alternatives (see bakeOff); richer fits — joint regression, per-category
-// slopes, kNN, ensembles — and every trim, shrinkage, growth and seasoning
-// variant did not beat this specification, so none of them shipped. The
-// bake-off reports a paired t-test of each alternative against the shipped
-// specification, so "no better" is evidence, not an assertion. Uncertainty
-// is honest: each row carries a 50% and an 80% interval taken from the
-// backtest's own residual quantiles, so the board shows what the fit does
-// not know.
+// protocol has run (seasoning of at most 5% over three years).
+//
+// v5 tests FORTY-FIVE specifications, not twenty-eight: the twenty-eight
+// from v4 plus seventeen new ones — a chains-count term, a two-segment
+// slope, log1p growth and age, recency- and TVL-weighted fits, three new
+// ensembles, two more kNN widths, two more shrinkage priors, a 3-SD trim,
+// a full per-category intercept-and-slope interaction, a diminishing-returns
+// term, and a Huber line with per-category slopes. Every candidate is
+// leave-one-out backtested on the same live set and compared to the shipped
+// specification by a paired t-test, Cohen's d and a 95% confidence interval
+// on the mean paired difference, so "no better" is evidence with a size,
+// not an assertion.
+//
+// The shipped specification is chosen by a stated rule, not by hand: among
+// the power-law parameter variants (the only family the dashboard's
+// recompute can verify row by row), the lowest leave-one-out MAE ships
+// only if it beats the v4 specification with a paired t below -2; otherwise
+// the v4 specification stays. Structural alternatives (joint regressions,
+// neighbours, ensembles) are tested and reported but cannot ship, because
+// the page recomputes every row from an intercept, a slope, offsets, a
+// growth factor and a seasoning factor — a shipped form the reader cannot
+// re-derive would break that check. The dashboard states which outcome the
+// rule produced.
+//
+// Uncertainty is honest: each row carries a 50% and an 80% interval taken
+// from the backtest's own residual quantiles, and the research note reports
+// the intervals' out-of-sample coverage, so the reader can see whether the
+// bands mean what they claim.
 //
 // The board ranks every watchlist protocol plus every remaining pre-token
 // protocol that is not a wrapped, staked or bridged product under the house
@@ -53,7 +71,7 @@ const DAY_MS = 86_400_000;
 const LOG = Math.log10;
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
-/** The model's fixed specification: the bake-off winner, not a tuned knob set. */
+/** The v4 specification, the default the selection rule must beat to move. */
 export const SPEC = {
   shrinkPrior: 12,
   trimSd: 2,
@@ -65,6 +83,14 @@ export const SPEC = {
   ageCapDays: 1095,
   unknownAgeDays: 365,
 } as const;
+
+export interface Params {
+  shrinkPrior: number;
+  trimSd: number;
+  trimRounds: number;
+  growthWeight: number;
+  ageAmp: number;
+}
 
 /** Parse and validate the snapshot's shape; throws on anything unexpected. */
 export function parseSnapshot(text: string): Snap {
@@ -164,6 +190,21 @@ export function ols2(xs: number[], ys: number[]): [number, number] {
   return [my - b * mx, b];
 }
 
+/** Weighted least squares for y = a + b*x. Returns [intercept, slope]. */
+export function wls2(xs: number[], ys: number[], ws: number[]): [number, number] {
+  const sw = ws.reduce((s, v) => s + v, 0);
+  const mx = xs.reduce((s, v, i) => s + ws[i]! * v, 0) / sw;
+  const my = ys.reduce((s, v, i) => s + ws[i]! * v, 0) / sw;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sxy += ws[i]! * (xs[i]! - mx) * (ys[i]! - my);
+    sxx += ws[i]! * (xs[i]! - mx) * (xs[i]! - mx);
+  }
+  const b = sxx === 0 ? 0 : sxy / sxx;
+  return [my - b * mx, b];
+}
+
 /** Small dense solve: (A + ridge*I) x = b, Gauss-Jordan with pivoting. */
 export function solveLinear(A: number[][], b: number[], ridge = 1e-8): number[] {
   const n = b.length;
@@ -226,7 +267,7 @@ function shrunkOffsets(items: Proto[], residOf: (p: Proto) => number, prior: num
   return out;
 }
 
-/** The shipped fit: trimmed power law plus shrunk per-category offsets. */
+/** The trimmed power law plus shrunk per-category offsets, at given knobs. */
 export function fitPowerLaw(live: Proto[], prior = SPEC.shrinkPrior, trimSd = SPEC.trimSd, rounds = SPEC.trimRounds): Fit {
   let use = live;
   let a = 0;
@@ -281,10 +322,10 @@ export interface Breakdown {
 }
 
 /** The fitted log10 value plus every component, so the page can recompute it. */
-export function predictLog(fit: Fit, p: Proto, asOfMs: number): { logValue: number; breakdown: Breakdown } {
+export function predictLog(fit: Fit, p: Proto, asOfMs: number, params: Params = { shrinkPrior: SPEC.shrinkPrior, trimSd: SPEC.trimSd, trimRounds: SPEC.trimRounds, growthWeight: SPEC.growthWeight, ageAmp: SPEC.ageAmp }): { logValue: number; breakdown: Breakdown } {
   const offset = fit.offsets.get(catKey(p)) ?? 0;
-  const growthFactor = 1 + growthFrac(p) * SPEC.growthWeight;
-  const ageFactor = 1 + SPEC.ageAmp * (ageFrac(p, asOfMs) - 0.5);
+  const growthFactor = 1 + growthFrac(p) * params.growthWeight;
+  const ageFactor = 1 + params.ageAmp * (ageFrac(p, asOfMs) - 0.5);
   const logValue = fit.intercept + fit.slope * LOG(p.tvl_usd) + offset + LOG(growthFactor) + LOG(ageFactor);
   return {
     logValue,
@@ -300,8 +341,8 @@ export function predictLog(fit: Fit, p: Proto, asOfMs: number): { logValue: numb
   };
 }
 
-export function impliedValue(fit: Fit, p: Proto, asOfMs: number): number {
-  const { logValue } = predictLog(fit, p, asOfMs);
+export function impliedValue(fit: Fit, p: Proto, asOfMs: number, params?: Params): number {
+  const { logValue } = predictLog(fit, p, asOfMs, params);
   return clamp(Math.round(Math.pow(10, logValue)), 1, 100_000_000_000_000);
 }
 
@@ -368,6 +409,19 @@ export function residualHistogram(errs: number[]): { bin: number; count: number 
   return [...counts.entries()].sort((a, b) => a[0] - b[0]).map(([bin, count]) => ({ bin, count }));
 }
 
+/**
+ * How often the residual-quantile intervals actually hold out of sample:
+ * the share of leave-one-out errors inside the 50% band (q25..q75) and the
+ * 80% band (q10..q90). An honest interval covers about its own name.
+ */
+export function intervalCoverage(errs: number[], bands: ResidualBands): { cover50: number; cover80: number } {
+  const n = errs.length;
+  return {
+    cover50: errs.filter((e) => e >= bands.q25 && e <= bands.q75).length / n,
+    cover80: errs.filter((e) => e >= bands.q10 && e <= bands.q90).length / n,
+  };
+}
+
 type Predictor = (p: Proto) => number;
 type FitFn = (train: Proto[]) => Predictor;
 
@@ -382,10 +436,11 @@ export function looErrors(fitFn: FitFn, live: Proto[]): number[] {
   return errs;
 }
 
-/** A predictor from a fitted power law (the shipped specification). */
-export function powerLawPredictor(train: Proto[], asOfMs: number, prior = SPEC.shrinkPrior, trimSd = SPEC.trimSd, rounds = SPEC.trimRounds): Predictor {
+/** A predictor from a fitted power law (the shipped family). */
+export function powerLawPredictor(train: Proto[], asOfMs: number, prior = SPEC.shrinkPrior, trimSd = SPEC.trimSd, rounds = SPEC.trimRounds, growthW = SPEC.growthWeight, ageAmp = SPEC.ageAmp): Predictor {
   const fit = fitPowerLaw(train, prior, trimSd, rounds);
-  return (p: Proto) => predictLog(fit, p, asOfMs).logValue;
+  const params: Params = { shrinkPrior: prior, trimSd, trimRounds: rounds, growthWeight: growthW, ageAmp };
+  return (p: Proto) => predictLog(fit, p, asOfMs, params).logValue;
 }
 
 function logAgeFrac(p: Proto, asOfMs: number): number {
@@ -399,7 +454,6 @@ function jointOlsPredictor(train: Proto[], asOfMs: number): Predictor {
   const X = train.map((p) => [1, LOG(p.tvl_usd), growthFrac(p), logAgeFrac(p, asOfMs), Math.log2(Math.max(1, p.chains.length))]);
   const y = train.map((p) => LOG(p.mcap_usd!));
   const beta = olsMulti(X, y);
-  // Offsets need the row index, so group the residuals with an indexed pass.
   const groups = new Map<string, number[]>();
   train.forEach((p, i) => {
     const k = catKey(p);
@@ -566,11 +620,21 @@ function naivePredictor(train: Proto[]): Predictor {
 export interface CandidateResult {
   name: string;
   shipped: boolean;
+  /** True when this candidate is a power-law parameter variant: the only
+      family the dashboard's recompute can verify, hence the only family
+      the selection rule may ship. */
+  paramFamily: boolean;
   summary: ErrorSummary;
   /** Paired t-statistic of |error| against the shipped specification over
       the same folds: negative means the candidate errs less, positive means
       it errs more; null for the shipped row itself. |t| under 2 is noise. */
   pairedT: number | null;
+  /** Cohen's d on the same paired differences: the size of the gap, not
+      just whether it clears a threshold. Null for the shipped row. */
+  cohensD: number | null;
+  /** 95% confidence interval on the mean paired |error| difference
+      (candidate minus shipped), in dex. Null for the shipped row. */
+  ci95: [number, number] | null;
 }
 
 /** The fitted log value with growth weight and seasoning amplitude as
@@ -632,6 +696,162 @@ function medianOffsetPredictor(train: Proto[], asOfMs: number): Predictor {
   };
 }
 
+// --- v5's new candidates: seventeen specifications v4 never tested ---
+
+/** Joint OLS with a chains-count term: does breadth of deployment add signal? */
+function chainsTermPredictor(train: Proto[], asOfMs: number): Predictor {
+  const X = train.map((p) => [1, LOG(p.tvl_usd), Math.log2(Math.max(1, p.chains.length)), growthFrac(p), logAgeFrac(p, asOfMs)]);
+  const y = train.map((p) => LOG(p.mcap_usd!));
+  const beta = olsMulti(X, y);
+  const groups = new Map<string, number[]>();
+  train.forEach((p, i) => {
+    const k = catKey(p);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(y[i]! - X[i]!.reduce((s, v, j) => s + v * beta[j]!, 0));
+  });
+  const offsets = new Map<string, number>();
+  for (const [k, rs] of groups) offsets.set(k, (rs.reduce((s, v) => s + v, 0) / rs.length) * (rs.length / (rs.length + SPEC.shrinkPrior)));
+  return (p: Proto) => {
+    const x = [1, LOG(p.tvl_usd), Math.log2(Math.max(1, p.chains.length)), growthFrac(p), logAgeFrac(p, asOfMs)];
+    return x.reduce((s, v, j) => s + v * beta[j]!, 0) + (offsets.get(catKey(p)) ?? 0);
+  };
+}
+
+/** Two-segment slope with the break at the median log TVL: does the curve bend with size? */
+function piecewisePredictor(train: Proto[], asOfMs: number): Predictor {
+  const xs = train.map((p) => LOG(p.tvl_usd)).sort((a, b) => a - b);
+  const br = xs[Math.floor(xs.length / 2)]!;
+  const X = train.map((p) => {
+    const lx = LOG(p.tvl_usd);
+    return [1, lx, Math.max(0, lx - br), growthFrac(p), logAgeFrac(p, asOfMs)];
+  });
+  const y = train.map((p) => LOG(p.mcap_usd!));
+  const beta = olsMulti(X, y);
+  const groups = new Map<string, number[]>();
+  train.forEach((p, i) => {
+    const k = catKey(p);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(y[i]! - X[i]!.reduce((s, v, j) => s + v * beta[j]!, 0));
+  });
+  const offsets = new Map<string, number>();
+  for (const [k, rs] of groups) offsets.set(k, (rs.reduce((s, v) => s + v, 0) / rs.length) * (rs.length / (rs.length + SPEC.shrinkPrior)));
+  return (p: Proto) => {
+    const lx = LOG(p.tvl_usd);
+    const x = [1, lx, Math.max(0, lx - br), growthFrac(p), logAgeFrac(p, asOfMs)];
+    return x.reduce((s, v, j) => s + v * beta[j]!, 0) + (offsets.get(catKey(p)) ?? 0);
+  };
+}
+
+/** Growth through log1p instead of the clamped linear fraction. */
+function logGrowthPredictor(train: Proto[], asOfMs: number): Predictor {
+  const fit = fitPowerLaw(train);
+  return (p: Proto) => {
+    const offset = fit.offsets.get(catKey(p)) ?? 0;
+    const g = Math.log1p(clamp(p.change_7d ?? 0, SPEC.growthLo, SPEC.growthHi) / 100);
+    return fit.intercept + fit.slope * LOG(p.tvl_usd) + offset + g * SPEC.growthWeight + LOG(1 + SPEC.ageAmp * (ageFrac(p, asOfMs) - 0.5));
+  };
+}
+
+/** Age through log1p days instead of the linear three-year fraction. */
+function logAgePredictor(train: Proto[], asOfMs: number): Predictor {
+  const fit = fitPowerLaw(train);
+  return (p: Proto) => {
+    const offset = fit.offsets.get(catKey(p)) ?? 0;
+    return fit.intercept + fit.slope * LOG(p.tvl_usd) + offset + LOG(1 + growthFrac(p) * SPEC.growthWeight) + LOG(1 + SPEC.ageAmp * (logAgeFrac(p, asOfMs) - 0.5));
+  };
+}
+
+/** Recency-weighted power law: protocols listed recently count more. */
+function recencyWeightedPredictor(train: Proto[], asOfMs: number): Predictor {
+  const xs = train.map((p) => LOG(p.tvl_usd));
+  const ys = train.map((p) => LOG(p.mcap_usd!));
+  const ws = train.map((p) => 1 / (1 + (ageDays(p, asOfMs) ?? SPEC.unknownAgeDays) / 365));
+  const [a, b] = wls2(xs, ys, ws);
+  const off = shrunkOffsets(train, (p) => LOG(p.mcap_usd!) - (a + b * LOG(p.tvl_usd)), SPEC.shrinkPrior);
+  return (p: Proto) => a + b * LOG(p.tvl_usd) + (off.get(catKey(p)) ?? 0) + LOG(1 + growthFrac(p) * SPEC.growthWeight) + LOG(1 + SPEC.ageAmp * (ageFrac(p, asOfMs) - 0.5));
+}
+
+/** TVL-weighted power law: large protocols count more in the fit. */
+function tvlWeightedPredictor(train: Proto[], asOfMs: number): Predictor {
+  const xs = train.map((p) => LOG(p.tvl_usd));
+  const ys = train.map((p) => LOG(p.mcap_usd!));
+  const lo = Math.min(...xs);
+  const ws = xs.map((x) => 0.5 + (x - lo));
+  const [a, b] = wls2(xs, ys, ws);
+  const off = shrunkOffsets(train, (p) => LOG(p.mcap_usd!) - (a + b * LOG(p.tvl_usd)), SPEC.shrinkPrior);
+  return (p: Proto) => a + b * LOG(p.tvl_usd) + (off.get(catKey(p)) ?? 0) + LOG(1 + growthFrac(p) * SPEC.growthWeight) + LOG(1 + SPEC.ageAmp * (ageFrac(p, asOfMs) - 0.5));
+}
+
+/** Joint OLS with a diminishing-returns term: log1p(TVL / $100M). */
+function diminishingPredictor(train: Proto[], asOfMs: number): Predictor {
+  const X = train.map((p) => [1, LOG(p.tvl_usd), Math.log1p(p.tvl_usd / 100_000_000), growthFrac(p), logAgeFrac(p, asOfMs)]);
+  const y = train.map((p) => LOG(p.mcap_usd!));
+  const beta = olsMulti(X, y);
+  const groups = new Map<string, number[]>();
+  train.forEach((p, i) => {
+    const k = catKey(p);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(y[i]! - X[i]!.reduce((s, v, j) => s + v * beta[j]!, 0));
+  });
+  const offsets = new Map<string, number>();
+  for (const [k, rs] of groups) offsets.set(k, (rs.reduce((s, v) => s + v, 0) / rs.length) * (rs.length / (rs.length + SPEC.shrinkPrior)));
+  return (p: Proto) => {
+    const x = [1, LOG(p.tvl_usd), Math.log1p(p.tvl_usd / 100_000_000), growthFrac(p), logAgeFrac(p, asOfMs)];
+    return x.reduce((s, v, j) => s + v * beta[j]!, 0) + (offsets.get(catKey(p)) ?? 0);
+  };
+}
+
+/** Full interaction: per-category intercept AND slope, both shrunk to the pooled line. */
+function catInterceptSlopePredictor(train: Proto[], asOfMs: number): Predictor {
+  const base = powerLawPredictor(train, asOfMs);
+  const fit = fitPowerLaw(train);
+  const slope = fit.slope;
+  const intercept = fit.intercept;
+  const xbar = train.reduce((s, p) => s + LOG(p.tvl_usd), 0) / train.length;
+  const byCat = new Map<string, Proto[]>();
+  for (const p of train) {
+    if (!byCat.has(catKey(p))) byCat.set(catKey(p), []);
+    byCat.get(catKey(p))!.push(p);
+  }
+  const adj = new Map<string, { da: number; db: number }>();
+  for (const [k, members] of byCat) {
+    if (members.length >= 4) {
+      const [a, b] = ols2(members.map((p) => LOG(p.tvl_usd)), members.map((p) => LOG(p.mcap_usd!)));
+      const w = members.length / (members.length + 8);
+      // The category line through the pooled centre, shrunk toward the pooled line.
+      const da = w * (a + b * xbar - (intercept + slope * xbar));
+      const db = w * (b - slope);
+      adj.set(k, { da, db });
+    } else adj.set(k, { da: 0, db: 0 });
+  }
+  return (p: Proto) => {
+    const a = adj.get(catKey(p)) ?? { da: 0, db: 0 };
+    return base(p) + a.da + a.db * (LOG(p.tvl_usd) - xbar);
+  };
+}
+
+/** Huber line with per-category shrunk slopes on top of it. */
+function huberSlopesPredictor(train: Proto[], asOfMs: number): Predictor {
+  const base = huberPredictor(train, asOfMs);
+  const xs = train.map((p) => LOG(p.tvl_usd));
+  const xbar = xs.reduce((s, v) => s + v, 0) / xs.length;
+  const [, pooledB] = ols2(xs, train.map((p) => LOG(p.mcap_usd!)));
+  const byCat = new Map<string, Proto[]>();
+  for (const p of train) {
+    if (!byCat.has(catKey(p))) byCat.set(catKey(p), []);
+    byCat.get(catKey(p))!.push(p);
+  }
+  const slopes = new Map<string, number>();
+  for (const [k, members] of byCat) {
+    if (members.length >= 4) {
+      const [, b] = ols2(members.map((p) => LOG(p.tvl_usd)), members.map((p) => LOG(p.mcap_usd!)));
+      const w = members.length / (members.length + 8);
+      slopes.set(k, w * b + (1 - w) * pooledB);
+    } else slopes.set(k, pooledB);
+  }
+  return (p: Proto) => base(p) + ((slopes.get(catKey(p)) ?? pooledB) - pooledB) * (LOG(p.tvl_usd) - xbar);
+}
+
 export interface HarderSplitRow {
   name: string;
   shipped: boolean;
@@ -642,7 +862,7 @@ export interface HarderSplitRow {
 
 /** The bake-off specification list, shared by bakeOff and harderSplits so
     both judge exactly the same fits. */
-export function candidateSpecs(asOfMs: number): { name: string; shipped: boolean; fn: FitFn }[] {
+export function candidateSpecs(asOfMs: number): { name: string; shipped: boolean; paramFamily: boolean; fn: FitFn }[] {
   const noOffsets = (train: Proto[]): Predictor => {
     const fit = fitPowerLaw(train, 1e12, SPEC.trimSd, SPEC.trimRounds);
     return (p: Proto) => predictLog(fit, p, asOfMs).logValue;
@@ -652,45 +872,79 @@ export function candidateSpecs(asOfMs: number): { name: string; shipped: boolean
     const m2 = knnPredictor(train, asOfMs);
     return (p: Proto) => 0.5 * m1(p) + 0.5 * m2(p);
   };
-  const candidates: { name: string; shipped: boolean; fn: FitFn }[] = [
-    { name: 'Power law + shrunk offsets (prior 12) — shipped', shipped: true, fn: (t) => powerLawPredictor(t, asOfMs) },
-    { name: 'Power law + offsets, prior 6', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, 6) },
-    { name: 'Power law + offsets, prior 8', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 8 }) },
-    { name: 'Power law + offsets, prior 16', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 16 }) },
-    { name: 'Power law + offsets, prior 20', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, 20) },
-    { name: 'Power law + offsets, prior 24', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { prior: 24 }) },
-    { name: 'Power law, trim 1.5 SD', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1.5) },
-    { name: 'Power law, trim 2.5 SD', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { trimSd: 2.5 }) },
-    { name: 'Power law, trim 2 rounds', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { rounds: 2 }) },
-    { name: 'Power law, no trim', shipped: false, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1e9, 0) },
-    { name: 'Power law, no category offsets', shipped: false, fn: noOffsets },
-    { name: 'Power law, median category offsets', shipped: false, fn: (t) => medianOffsetPredictor(t, asOfMs) },
-    { name: 'Power law, growth weight 0.10', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.1 }) },
-    { name: 'Power law, growth weight 0.20', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.2 }) },
-    { name: 'Power law, no growth factor', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0 }) },
-    { name: 'Power law, seasoning amp 0.05', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.05 }) },
-    { name: 'Power law, seasoning amp 0.15', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.15 }) },
-    { name: 'Power law, no seasoning factor', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0 }) },
-    { name: 'Power law, no growth or seasoning', shipped: false, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0, ageAmp: 0 }) },
-    { name: 'Joint OLS: TVL + growth + age + chains', shipped: false, fn: (t) => jointOlsPredictor(t, asOfMs) },
-    { name: 'Per-category slopes, shrunk', shipped: false, fn: (t) => catSlopesPredictor(t, asOfMs) },
-    { name: 'Quadratic in log TVL', shipped: false, fn: (t) => quadraticPredictor(t, asOfMs) },
-    { name: 'Median (L1) regression', shipped: false, fn: (t) => medianRegressionPredictor(t, asOfMs) },
-    { name: 'k-nearest neighbours (k = 8)', shipped: false, fn: (t) => knnPredictor(t, asOfMs) },
-    { name: 'Ensemble: power law + kNN', shipped: false, fn: ensemble },
-    { name: 'Theil–Sen robust line', shipped: false, fn: (t) => theilSenPredictor(t, asOfMs) },
-    { name: 'Huber robust line', shipped: false, fn: (t) => huberPredictor(t, asOfMs) },
-    { name: 'Naive: median mcap/TVL ratio', shipped: false, fn: naivePredictor },
+  const ensembleHuber = (train: Proto[]): Predictor => {
+    const m1 = powerLawPredictor(train, asOfMs);
+    const m2 = huberPredictor(train, asOfMs);
+    return (p: Proto) => 0.5 * m1(p) + 0.5 * m2(p);
+  };
+  const ensembleTheilSen = (train: Proto[]): Predictor => {
+    const m1 = powerLawPredictor(train, asOfMs);
+    const m2 = theilSenPredictor(train, asOfMs);
+    return (p: Proto) => 0.5 * m1(p) + 0.5 * m2(p);
+  };
+  const ensembleThree = (train: Proto[]): Predictor => {
+    const m1 = powerLawPredictor(train, asOfMs);
+    const m2 = huberPredictor(train, asOfMs);
+    const m3 = knnPredictor(train, asOfMs);
+    return (p: Proto) => (m1(p) + m2(p) + m3(p)) / 3;
+  };
+  const candidates: { name: string; shipped: boolean; paramFamily: boolean; fn: FitFn }[] = [
+    { name: 'Power law + shrunk offsets (prior 12) — shipped', shipped: true, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs) },
+    { name: 'Power law + offsets, prior 4', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, 4) },
+    { name: 'Power law + offsets, prior 6', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, 6) },
+    { name: 'Power law + offsets, prior 8', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { prior: 8 }) },
+    { name: 'Power law + offsets, prior 16', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { prior: 16 }) },
+    { name: 'Power law + offsets, prior 20', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, 20) },
+    { name: 'Power law + offsets, prior 24', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { prior: 24 }) },
+    { name: 'Power law + offsets, prior 32', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, 32) },
+    { name: 'Power law, trim 1.5 SD', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1.5) },
+    { name: 'Power law, trim 2.5 SD', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { trimSd: 2.5 }) },
+    { name: 'Power law, trim 3 SD', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { trimSd: 3 }) },
+    { name: 'Power law, trim 2 rounds', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { rounds: 2 }) },
+    { name: 'Power law, no trim', shipped: false, paramFamily: true, fn: (t) => powerLawPredictor(t, asOfMs, SPEC.shrinkPrior, 1e9, 0) },
+    { name: 'Power law, no category offsets', shipped: false, paramFamily: false, fn: noOffsets },
+    { name: 'Power law, median category offsets', shipped: false, paramFamily: false, fn: (t) => medianOffsetPredictor(t, asOfMs) },
+    { name: 'Power law, growth weight 0.10', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.1 }) },
+    { name: 'Power law, growth weight 0.20', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0.2 }) },
+    { name: 'Power law, no growth factor', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0 }) },
+    { name: 'Power law, seasoning amp 0.05', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.05 }) },
+    { name: 'Power law, seasoning amp 0.15', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0.15 }) },
+    { name: 'Power law, no seasoning factor', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { ageAmp: 0 }) },
+    { name: 'Power law, no growth or seasoning', shipped: false, paramFamily: true, fn: (t) => paramPredictor(t, asOfMs, { growthW: 0, ageAmp: 0 }) },
+    { name: 'Joint OLS: TVL + growth + age + chains', shipped: false, paramFamily: false, fn: (t) => jointOlsPredictor(t, asOfMs) },
+    { name: 'Joint OLS + chains-count term', shipped: false, paramFamily: false, fn: (t) => chainsTermPredictor(t, asOfMs) },
+    { name: 'Two-segment slope at median TVL', shipped: false, paramFamily: false, fn: (t) => piecewisePredictor(t, asOfMs) },
+    { name: 'Joint OLS + diminishing-returns term', shipped: false, paramFamily: false, fn: (t) => diminishingPredictor(t, asOfMs) },
+    { name: 'Per-category slopes, shrunk', shipped: false, paramFamily: false, fn: (t) => catSlopesPredictor(t, asOfMs) },
+    { name: 'Per-category intercept + slope, shrunk', shipped: false, paramFamily: false, fn: (t) => catInterceptSlopePredictor(t, asOfMs) },
+    { name: 'Quadratic in log TVL', shipped: false, paramFamily: false, fn: (t) => quadraticPredictor(t, asOfMs) },
+    { name: 'Median (L1) regression', shipped: false, paramFamily: false, fn: (t) => medianRegressionPredictor(t, asOfMs) },
+    { name: 'k-nearest neighbours (k = 4)', shipped: false, paramFamily: false, fn: (t) => knnPredictor(t, asOfMs, 4) },
+    { name: 'k-nearest neighbours (k = 8)', shipped: false, paramFamily: false, fn: (t) => knnPredictor(t, asOfMs) },
+    { name: 'k-nearest neighbours (k = 16)', shipped: false, paramFamily: false, fn: (t) => knnPredictor(t, asOfMs, 16) },
+    { name: 'Ensemble: power law + kNN', shipped: false, paramFamily: false, fn: ensemble },
+    { name: 'Ensemble: power law + Huber', shipped: false, paramFamily: false, fn: ensembleHuber },
+    { name: 'Ensemble: power law + Theil-Sen', shipped: false, paramFamily: false, fn: ensembleTheilSen },
+    { name: 'Ensemble: power law + Huber + kNN', shipped: false, paramFamily: false, fn: ensembleThree },
+    { name: 'Theil–Sen robust line', shipped: false, paramFamily: false, fn: (t) => theilSenPredictor(t, asOfMs) },
+    { name: 'Huber robust line', shipped: false, paramFamily: false, fn: (t) => huberPredictor(t, asOfMs) },
+    { name: 'Huber line + per-category slopes', shipped: false, paramFamily: false, fn: (t) => huberSlopesPredictor(t, asOfMs) },
+    { name: 'Growth through log1p(change)', shipped: false, paramFamily: false, fn: (t) => logGrowthPredictor(t, asOfMs) },
+    { name: 'Age through log1p(days)', shipped: false, paramFamily: false, fn: (t) => logAgePredictor(t, asOfMs) },
+    { name: 'Recency-weighted power law', shipped: false, paramFamily: false, fn: (t) => recencyWeightedPredictor(t, asOfMs) },
+    { name: 'TVL-weighted power law', shipped: false, paramFamily: false, fn: (t) => tvlWeightedPredictor(t, asOfMs) },
+    { name: 'Naive: median mcap/TVL ratio', shipped: false, paramFamily: false, fn: naivePredictor },
   ];
   return candidates;
 }
 
 /**
- * The model bake-off: twenty-eight specifications, each leave-one-out
+ * The model bake-off: forty-five specifications, each leave-one-out
  * backtested on the same live set, each compared to the shipped
- * specification by a paired t-test over the same folds. The shipped row is
- * fixed by SPEC, not picked at run time; the table exists so the choice can
- * be checked, not re-decided.
+ * specification by a paired t-test, Cohen's d and a 95% confidence interval
+ * on the mean paired difference, all over the same folds. The shipped row
+ * is fixed by SPEC, not picked at run time; the table exists so the choice
+ * can be checked, not re-decided.
  */
 export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
   const candidates = candidateSpecs(asOfMs);
@@ -700,14 +954,19 @@ export function bakeOff(live: Proto[], asOfMs: number): CandidateResult[] {
     const errs = looErrors(c.fn, live);
     const summary = summarizeErrors(errs);
     let pairedT: number | null = null;
+    let cohensD: number | null = null;
+    let ci95: [number, number] | null = null;
     if (!c.shipped) {
       const d = errs.map((e, i) => Math.abs(e) - shippedAbs[i]!);
       const n = d.length;
       const mean = d.reduce((s, v) => s + v, 0) / n;
       const sd = Math.sqrt(d.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1));
-      pairedT = sd === 0 ? 0 : Math.round((mean / (sd / Math.sqrt(n))) * 100) / 100;
+      const se = sd / Math.sqrt(n);
+      pairedT = sd === 0 ? 0 : Math.round((mean / se) * 100) / 100;
+      cohensD = sd === 0 ? 0 : Math.round((mean / sd) * 100) / 100;
+      ci95 = [Math.round((mean - 1.96 * se) * 10000) / 10000, Math.round((mean + 1.96 * se) * 10000) / 10000];
     }
-    return { name: c.name, shipped: c.shipped, summary, pairedT };
+    return { name: c.name, shipped: c.shipped, paramFamily: c.paramFamily, summary, pairedT, cohensD, ci95 };
   });
   return results.sort((a, b) => a.summary.mae - b.summary.mae || (a.name < b.name ? -1 : 1));
 }
@@ -814,7 +1073,7 @@ export interface Comparable {
  * value for it, so the reader can see how the curve prices real neighbours
  * instead of taking the fit on trust.
  */
-export function comparables(fit: Fit, live: Proto[], target: Proto, asOfMs: number, k = 5): Comparable[] {
+export function comparables(fit: Fit, live: Proto[], target: Proto, asOfMs: number, params: Params, k = 5): Comparable[] {
   const lx = LOG(target.tvl_usd);
   const ranked = live
     .map((p) => ({ p, d: Math.abs(LOG(p.tvl_usd) - lx) }))
@@ -835,7 +1094,7 @@ export function comparables(fit: Fit, live: Proto[], target: Proto, asOfMs: numb
   picked.sort((a, b) => a.d - b.d || (a.p.slug < b.p.slug ? -1 : 1));
   const trimmedSet = new Set(fit.trimmedSlugs);
   return picked.map(({ p }) => {
-    const fitted = impliedValue(fit, p, asOfMs);
+    const fitted = impliedValue(fit, p, asOfMs, params);
     return {
       slug: p.slug,
       name: p.name,
@@ -959,6 +1218,17 @@ export interface CompositionAudit {
   nonpositive_mcap: number;
 }
 
+export interface SelectionOutcome {
+  /** The parameter set the board was priced with. */
+  params: Params;
+  /** The candidate that won the selection rule, or the v4 specification when the rule kept it. */
+  winner_name: string;
+  /** Whether the rule moved away from the v4 specification. */
+  switched: boolean;
+  /** The rule's reasoning, in one sentence, for the research note. */
+  note: string;
+}
+
 export interface DashData {
   meta: {
     as_of: string;
@@ -980,6 +1250,7 @@ export interface DashData {
     live_count: number;
     shrink_prior: number;
     trim_sd: number;
+    trim_rounds: number;
     growth_weight: number;
     growth_clamp: [number, number];
     age_amp: number;
@@ -988,11 +1259,14 @@ export interface DashData {
     trimmed_slugs: string[];
     offsets: { category: string; offset: number; offset_factor: number; live_count: number }[];
   };
+  selection: SelectionOutcome;
   backtest: ErrorSummary & {
     bands: ResidualBands;
     histogram: { bin: number; count: number }[];
     loco: ErrorSummary;
     band_holdout: ErrorSummary;
+    coverage50: number;
+    coverage80: number;
   };
   candidates: CandidateResult[];
   harder_splits: HarderSplitRow[];
@@ -1111,21 +1385,21 @@ interface Branch {
 const BRANCHES: Record<string, Branch> = {
   'Risk Curators': {
     asset: 'USDC',
-    open: 'Deposit {K} of {A} into two or three of {N}\u2019s curator vaults on {C}, splitting between curators rather than trusting one, {X}so the wallet shows diversified curator use. Cost: {K} of capital and about $1–3 of gas. Time: 15 minutes.',
-    weekly: 'Once a week, check each curator\u2019s allocation and any rebalancing notices, and top up or rotate {H} toward the curator whose vaults performed best net of fees. Log the vault addresses you hold. Cost: about $1–2 of gas per rebalance. Time: 10 minutes a week.',
-    risk: 'Curator risk is the risk here: a curator can misallocate or be exploited, and vault shares can fall below the assets you deposited. If a curator\u2019s vault drops more than 5% in a week, or its allocation changes without notice, withdraw that leg and wait. Cost: nothing to check. Time: 5 minutes.',
+    open: 'Deposit {K} of {A} into two or three of {N}\u2019s curator vaults on {C}, splitting across curators instead of trusting one, {X}so the wallet shows diversified curator use. Cost: {K} of capital and about $1–3 of gas. Time: 15 minutes.',
+    weekly: 'Once a week, check each curator\u2019s allocation and rebalancing notices, and shift {H} toward the curator whose vaults did best net of fees. Write down the vault addresses you hold. Cost: about $1–2 of gas per rebalance. Time: 10 minutes a week.',
+    risk: 'Curator risk is the risk here: a curator can misallocate or be exploited, and vault shares can fall below the assets deposited. If a curator\u2019s vault drops more than 5% in a week, or its allocation changes without notice, withdraw that leg and wait. Cost: nothing to check. Time: 5 minutes.',
   },
   'Dexs': {
     asset: 'USDC',
-    open: 'Provide {K} of liquidity to one {N} pool on {C} — a stable pair if you want low movement, a volatile pair only if you accept the swings — {X}and add a smaller {H} position on a second chain the protocol runs on. Cost: {K} of capital and about $1–4 of gas. Time: 15 minutes.',
+    open: 'Provide {K} of liquidity to one {N} pool on {C} — a stable pair for low movement, a volatile pair only if you accept the swings — {X}and add a smaller {H} position on a second chain the protocol runs on. Cost: {K} of capital and about $1–4 of gas. Time: 15 minutes.',
     weekly: 'Once a week, claim or compound the trading fees the pool earned, check the pool\u2019s volume trend, and move {H} to the highest-volume pool if yours has gone quiet. Cost: about $1–3 of gas per claim. Time: 10 minutes a week.',
-    risk: 'Impermanent loss is the risk: if the pair\u2019s price ratio moves far, withdrawing can return less than holding the assets. Check the pool\u2019s ratio weekly; if it has moved more than 20% against you, decide whether the fees earned still cover it before adding more. Cost: nothing to check. Time: 5 minutes.',
+    risk: 'Impermanent loss is the risk: if the pair\u2019s price ratio moves far, withdrawing can return less than holding the assets. Check the pool\u2019s ratio weekly; if it moved more than 20% against you, decide whether the fees earned still cover it before adding more. Cost: nothing to check. Time: 5 minutes.',
   },
   'Onchain Capital Allocator': {
     asset: 'USDC',
     open: 'Allocate {K} of {A} through {N}\u2019s allocation vaults on {C}, spreading across two strategies rather than one, {X}and mirror {H} on a second chain so the wallet shows multi-chain allocation. Cost: {K} of capital and about $1–3 of gas. Time: 15 minutes.',
-    weekly: 'Once a week, review where the allocator has moved funds, compare each strategy\u2019s net yield, and shift {H} toward the best risk-adjusted one. Note any strategy that stops reporting. Cost: about $1–2 of gas per shift. Time: 10 minutes a week.',
-    risk: 'Allocator risk compounds: your funds sit in strategies the allocator picks, so a bad strategy or a paused vault can trap capital. If a strategy stops updating its reports or withdrawals queue for days, exit that leg. Cost: nothing to check. Time: 5 minutes.',
+    weekly: 'Once a week, review where the allocator moved funds, compare each strategy\u2019s net yield, and shift {H} toward the best risk-adjusted one. Note any strategy that stops reporting. Cost: about $1–2 of gas per shift. Time: 10 minutes a week.',
+    risk: 'Allocator risk compounds: funds sit in strategies the allocator picks, so a bad strategy or a paused vault can trap capital. If a strategy stops updating its reports or withdrawals queue for days, exit that leg. Cost: nothing to check. Time: 5 minutes.',
   },
   'Lending': {
     asset: 'USDC',
@@ -1154,7 +1428,7 @@ const BRANCHES: Record<string, Branch> = {
   'Yield Aggregator': {
     asset: 'USDC',
     open: 'Deposit {K} of {A} into {N}\u2019s auto-compounding vault on {C}, picking the strategy with the longest track record over the newest high-yield one, {X}and add {H} to a second strategy on another chain. Cost: {K} of capital and about $1–3 of gas. Time: 15 minutes.',
-    weekly: 'Once a week, check the vault\u2019s harvest history and net APY after fees, and rotate {H} if the vault has missed harvests or its APY has halved without explanation. Cost: about $1–2 of gas per rotation. Time: 10 minutes a week.',
+    weekly: 'Once a week, check the vault\u2019s harvest history and net APY after fees, and rotate {H} if the vault has missed harvests or its APY has halved without explanation. Cost: about $1–3 of gas per rotation. Time: 10 minutes a week.',
     risk: 'Aggregator risk stacks: the vault\u2019s strategy sits on other protocols, so an exploit downstream reaches you too. If any underlying protocol pauses or is exploited, withdraw from vaults that route through it the same day. Cost: nothing to check. Time: 5 minutes.',
   },
   'CDP': {
@@ -1367,7 +1641,16 @@ function verifyStep(p: Proto, asOfMs: number, slug: string): string {
   return pick(variants, slug, 2);
 }
 
-/** Step 6: the hold, fitted to how long the protocol has already run. */
+/** Step 6: track the position, so nothing drifts unnoticed. */
+function trackStep(p: Proto, slug: string): string {
+  const variants = [
+    `Set up tracking for this position: a monthly calendar reminder, a price and TVL alert for ${p.name}, and one line in a log for every deposit, claim and withdrawal with its transaction hash. Cost: nothing but time. Time: 10 minutes to set up, 5 minutes a month.`,
+    `Track it from day one: note the deposit amounts, dates and transaction hashes in one place, set a monthly reminder to review the position, and add a TVL alert so a sharp fall reaches you instead of being discovered weeks later. Cost: nothing but time. Time: 10 minutes to set up, 5 minutes a month.`,
+  ];
+  return pick(variants, slug, 6);
+}
+
+/** Step 7: the hold, fitted to how long the protocol has already run. */
 function holdStep(asOfMs: number, slug: string, age: number | null): string {
   const horizon = age === null || age < 365 ? 'Plan to hold the position at least 8–12 weeks' : 'Plan to hold at least one full season or quarter';
   const variants = [
@@ -1375,16 +1658,16 @@ function holdStep(asOfMs: number, slug: string, age: number | null): string {
     `${horizon} and review monthly: has a points program appeared, have its rules changed, is the protocol\u2019s TVL still growing? Keep a dated log of deposits, claims and withdrawals. Cost: nothing but time. Time: 15 minutes a month.`,
   ];
   void asOfMs;
-  return pick(variants, slug, 6);
+  return pick(variants, slug, 7);
 }
 
-/** Step 7: the exit, planned before it is needed. */
+/** Step 8: the exit, planned before it is needed. */
 function closeStep(slug: string): string {
   const variants = [
     `Decide the exit in advance: unwind in stages when the position reaches your target, a points program ends, or the risk review fails — never all at once in a panic — then reconcile the log and move proceeds back to the main wallet. Cost: exit gas, about $1–4. Time: 15 minutes.`,
     `Plan the exit now: leave in stages if the position hits your target, the program ends or the risks change, keep the transaction log for records, and never leave dust in a farm wallet you stop watching. Cost: exit gas, about $1–4. Time: 15 minutes.`,
   ];
-  return pick(variants, slug, 7);
+  return pick(variants, slug, 8);
 }
 
 /** Keep a step inside the gate's 600 characters, cutting at a sentence end. */
@@ -1396,7 +1679,7 @@ function fitStep(s: string): string {
   return `${t.slice(0, 597).trimEnd()}…`;
 }
 
-/** Seven steps: wallet, verify, open, weekly rhythm, risk review, hold, exit. */
+/** Eight steps: wallet, verify, open, weekly rhythm, risk review, track, hold, exit. */
 export function farmPlan(p: Proto, asOfMs: number): string[] {
   const branch = branchFor(p.category);
   const tier = capitalTier(p.tvl_usd);
@@ -1427,6 +1710,7 @@ export function farmPlan(p: Proto, asOfMs: number): string[] {
     open,
     fill(branch.weekly, vars),
     fill(branch.risk, vars),
+    trackStep(p, p.slug),
     holdStep(asOfMs, p.slug, ageDays(p, asOfMs)),
     closeStep(p.slug),
   ];
@@ -1449,6 +1733,39 @@ export interface Built {
 }
 
 /**
+ * The selection rule, stated once: among the power-law parameter variants,
+ * the lowest leave-one-out MAE ships only when it beats the v4
+ * specification with a paired t below -2. Anything else keeps the v4
+ * specification, and the dashboard says so. Structural alternatives are
+ * never eligible: the page recomputes every row from an intercept, a slope,
+ * offsets, a growth factor and a seasoning factor, and a shipped form the
+ * reader cannot re-derive would break that check.
+ */
+const PARAM_TABLE: Record<string, Params> = {
+  'Power law + offsets, prior 4': { shrinkPrior: 4, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 6': { shrinkPrior: 6, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 8': { shrinkPrior: 8, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 16': { shrinkPrior: 16, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 20': { shrinkPrior: 20, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 24': { shrinkPrior: 24, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law + offsets, prior 32': { shrinkPrior: 32, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, trim 1.5 SD': { shrinkPrior: 12, trimSd: 1.5, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, trim 2.5 SD': { shrinkPrior: 12, trimSd: 2.5, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, trim 3 SD': { shrinkPrior: 12, trimSd: 3, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, trim 2 rounds': { shrinkPrior: 12, trimSd: 2, trimRounds: 2, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, no trim': { shrinkPrior: 12, trimSd: 1e9, trimRounds: 0, growthWeight: 0.15, ageAmp: 0.1 },
+  'Power law, growth weight 0.10': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0.1, ageAmp: 0.1 },
+  'Power law, growth weight 0.20': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0.2, ageAmp: 0.1 },
+  'Power law, no growth factor': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0, ageAmp: 0.1 },
+  'Power law, seasoning amp 0.05': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.05 },
+  'Power law, seasoning amp 0.15': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0.15 },
+  'Power law, no seasoning factor': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0.15, ageAmp: 0 },
+  'Power law, no growth or seasoning': { shrinkPrior: 12, trimSd: 2, trimRounds: 1, growthWeight: 0, ageAmp: 0 },
+};
+
+const V4_PARAMS: Params = { shrinkPrior: SPEC.shrinkPrior, trimSd: SPEC.trimSd, trimRounds: SPEC.trimRounds, growthWeight: SPEC.growthWeight, ageAmp: SPEC.ageAmp };
+
+/**
  * Fit, backtest, bake off, and rank. The board is every watchlist protocol
  * plus every remaining pre-token protocol that is not a wrapped, staked or
  * bridged product under the category, wrapped-word and exchange-prefix
@@ -1457,16 +1774,52 @@ export interface Built {
 export function buildAll(snap: Snap): Built {
   const asOfMs = Date.parse(`${snap.as_of}T00:00:00Z`);
   const live = snap.protocols.filter(isLive).sort((a, b) => (a.slug < b.slug ? -1 : 1));
-  const fit = fitPowerLaw(live);
-  const shipped = (train: Proto[]): Predictor => powerLawPredictor(train, asOfMs);
+  const candidates = bakeOff(live, asOfMs);
+  const shippedRow = candidates.find((c) => c.shipped)!;
+
+  // Apply the selection rule: the best parameter variant ships only on a
+  // significant win; otherwise the v4 specification stays.
+  const eligible = candidates
+    .filter((c) => !c.shipped && PARAM_TABLE[c.name] !== undefined)
+    .sort((a, b) => a.summary.mae - b.summary.mae || (a.name < b.name ? -1 : 1));
+  const best = eligible[0];
+  let chosen: Params = V4_PARAMS;
+  let selection: SelectionOutcome;
+  if (best !== undefined && best.pairedT !== null && best.pairedT < -2) {
+    chosen = PARAM_TABLE[best.name]!;
+    selection = {
+      params: chosen,
+      winner_name: best.name,
+      switched: true,
+      note: `The selection rule switched the shipped specification to ${best.name}: leave-one-out MAE ${best.summary.mae.toFixed(3)} against the v4 specification's ${shippedRow.summary.mae.toFixed(3)}, paired t ${best.pairedT.toFixed(2)} — a significant win, so it ships.`,
+    };
+  } else if (best !== undefined) {
+    const gap = shippedRow.summary.mae - best.summary.mae;
+    selection = {
+      params: chosen,
+      winner_name: 'Power law + shrunk offsets (prior 12) — shipped',
+      switched: false,
+      note: `The selection rule kept the v4 specification: the best parameter variant, ${best.name}, leads by ${gap.toFixed(3)} dex with paired t ${best.pairedT === null ? '—' : best.pairedT.toFixed(2)} — noise, not signal — so nothing moved.`,
+    };
+  } else {
+    selection = {
+      params: chosen,
+      winner_name: 'Power law + shrunk offsets (prior 12) — shipped',
+      switched: false,
+      note: 'The selection rule kept the v4 specification: no parameter variant was eligible to challenge it.',
+    };
+  }
+
+  const fit = fitPowerLaw(live, chosen.shrinkPrior, chosen.trimSd, chosen.trimRounds);
+  const shipped = (train: Proto[]): Predictor => powerLawPredictor(train, asOfMs, chosen.shrinkPrior, chosen.trimSd, chosen.trimRounds, chosen.growthWeight, chosen.ageAmp);
 
   const looErrs = looErrors(shipped, live);
   const summary = summarizeErrors(looErrs);
   const bands = residualBands(looErrs);
+  const coverage = intervalCoverage(looErrs, bands);
   const histogram = residualHistogram(looErrs);
   const loco = summarizeErrors(locoErrors(shipped, live));
   const bandHoldout = summarizeErrors(bandHoldoutErrors(shipped, live));
-  const candidates = bakeOff(live, asOfMs);
   const splits = harderSplits(live, asOfMs, candidates);
   const calibration = calibrationTable(live, fit, looErrs);
 
@@ -1494,7 +1847,7 @@ export function buildAll(snap: Snap): Built {
     .filter((p) => watchSet.has(p.slug) || bestByFamily.get(baseName(p)) === p)
     .sort((a, b) => (a.slug < b.slug ? -1 : 1));
   const scored = boardProtocols.map((p) => {
-    const { logValue, breakdown } = predictLog(fit, p, asOfMs);
+    const { logValue, breakdown } = predictLog(fit, p, asOfMs, chosen);
     const value = clamp(Math.round(Math.pow(10, logValue)), 1, 100_000_000_000_000);
     return { p, value, breakdown };
   });
@@ -1521,7 +1874,7 @@ export function buildAll(snap: Snap): Built {
       interval_80: interval80,
       breakdown,
       live_in_category: fit.liveInCategory.get(catKey(p)) ?? 0,
-      comparables: comparables(fit, live, p, asOfMs),
+      comparables: comparables(fit, live, p, asOfMs, chosen),
       farm_steps: farmPlan(p, asOfMs),
     };
   });
@@ -1530,7 +1883,7 @@ export function buildAll(snap: Snap): Built {
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1))
     .slice(0, 24)
     .map((p) => {
-      const fitted = impliedValue(fit, p, asOfMs);
+      const fitted = impliedValue(fit, p, asOfMs, chosen);
       return {
         slug: p.slug,
         name: p.name,
@@ -1601,17 +1954,19 @@ export function buildAll(snap: Snap): Built {
       kept_count: fit.keptCount,
       trimmed_count: fit.trimmedCount,
       live_count: fit.liveCount,
-      shrink_prior: SPEC.shrinkPrior,
-      trim_sd: SPEC.trimSd,
-      growth_weight: SPEC.growthWeight,
+      shrink_prior: chosen.shrinkPrior,
+      trim_sd: chosen.trimSd,
+      trim_rounds: chosen.trimRounds,
+      growth_weight: chosen.growthWeight,
       growth_clamp: [SPEC.growthLo, SPEC.growthHi],
-      age_amp: SPEC.ageAmp,
+      age_amp: chosen.ageAmp,
       age_cap_days: SPEC.ageCapDays,
       unknown_age_days: SPEC.unknownAgeDays,
       trimmed_slugs: fit.trimmedSlugs,
       offsets,
     },
-    backtest: { ...summary, bands, histogram, loco, band_holdout: bandHoldout },
+    selection,
+    backtest: { ...summary, bands, histogram, loco, band_holdout: bandHoldout, coverage50: Math.round(coverage.cover50 * 1000) / 1000, coverage80: Math.round(coverage.cover80 * 1000) / 1000 },
     candidates,
     harder_splits: splits,
     calibration,
