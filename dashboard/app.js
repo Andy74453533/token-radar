@@ -4,9 +4,9 @@
 // detail view recomputes each row's implied value AND its intervals from the
 // snapshot figures and the published fit, so the page's arithmetic and the
 // board's data agree exactly. The research note shows the fit, the
-// forty-five-specification bake-off with effect sizes, the backtest with its
-// holdout splits and interval coverage, the per-category calibration, and
-// the chart the value model stands on.
+// forty-five-specification bake-off with effect sizes and fold-win shares,
+// the backtest with its holdout splits and interval coverage, the
+// per-category calibration, and the chart the value model stands on.
 (function () {
   'use strict';
   var D = window.RADAR;
@@ -14,6 +14,7 @@
 
   var state = { q: '', cat: 'all', chain: 'all', tvl: 'all', watch: false, tab: 'board', sort: 'rank', dir: 1, selected: null };
 
+  // --- small formatting helpers ---
   function money(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     var a = Math.abs(n);
@@ -43,6 +44,10 @@
   function signed(n, digits) {
     if (n === null || n === undefined || !isFinite(n)) return '—';
     return (n >= 0 ? '+' : '') + n.toFixed(digits === undefined ? 2 : digits);
+  }
+  function share(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    return Math.round(n * 100) + '%';
   }
 
   // --- the model, recomputed in the page from the row's own figures ---
@@ -88,17 +93,17 @@
       Math.pow(10, b.bands.q90).toFixed(1) + ' \u00b7 chosen over ' + (D.candidates.length - 1) +
       ' alternatives by backtest';
     var top = D.rows[0];
+    function stat(v, label) { return '<div><dt>' + label + '</dt><dd>' + esc(v) + '</dd></div>'; }
     document.getElementById('stats').innerHTML =
       stat(D.meta.board_size, 'Board rows') + stat(D.meta.watchlist_size + ' / ' + D.meta.watchlist_size, 'Watchlist covered') +
       stat(D.meta.early_size, 'Early finds') + stat(money(top.implied_value_usd), 'Top implied value') +
       stat(D.meta.as_of, 'Snapshot date');
-    function stat(v, label) { return '<div><dt>' + label + '</dt><dd>' + esc(v) + '</dd></div>'; }
     document.getElementById('source').textContent =
       'Source: the sealed snapshot dated ' + D.meta.as_of + ' (' + D.meta.snapshot_protocols +
       ' protocols at or above $5M TVL). The fit, the bake-off and the backtest are computed at build time from the snapshot alone; this page recomputes every row from the published parameters, and the recompute is checked in each detail view.';
   }
 
-  // --- filters ---
+  // --- filters and sorting ---
   function fillFilters() {
     var cats = {}, chains = {};
     D.rows.forEach(function (r) {
@@ -250,7 +255,7 @@
         : '<b>Recompute check FAILED:</b> the page recomputed $' + re.value.toLocaleString('en-US') + ' against the board\u2019s $' + row.implied_value_usd.toLocaleString('en-US') + '.') + '</p>';
   }
 
-  // --- research note ---
+  // --- charts ---
   function scatterSvg() {
     var W = 640, H = 400, L = 56, R = 16, T = 14, B = 44;
     var xs = D.scatter.map(function (p) { return p.x; }), ys = D.scatter.map(function (p) { return p.y; });
@@ -300,6 +305,7 @@
     return s + '</svg>';
   }
 
+  // --- research note ---
   function renderResearch() {
     var m = D.model, b = D.backtest;
     var cands = D.candidates.slice().sort(function (a, b) { return a.summary.mae - b.summary.mae; });
@@ -307,19 +313,23 @@
     var shippedRank = cands.indexOf(shipped) + 1;
     var leaders = cands.filter(function (c) { return !c.shipped && c.summary.mae < shipped.summary.mae; });
     var bestGap = leaders.length ? shipped.summary.mae - leaders[0].summary.mae : 0;
-    var maxLeaderT = 0, maxLeaderD = 0;
+    var maxLeaderT = 0, maxLeaderD = 0, maxLeaderWin = 0;
     leaders.forEach(function (c) {
       if (c.pairedT !== null && Math.abs(c.pairedT) > maxLeaderT) maxLeaderT = Math.abs(c.pairedT);
       if (c.cohensD !== null && Math.abs(c.cohensD) > maxLeaderD) maxLeaderD = Math.abs(c.cohensD);
+      if (c.winShare !== null && c.winShare > maxLeaderWin) maxLeaderWin = c.winShare;
     });
     var worseSignificant = cands.filter(function (c) { return !c.shipped && c.pairedT !== null && c.pairedT > 2; }).length;
+    // The new column: how often each challenger actually beat the shipped
+    // fit fold by fold. A mean gap can hide a win that comes from a few
+    // folds; the share shows whether the challenger wins routinely or rarely.
     var candRows = cands.map(function (c) {
       var ci = c.ci95 === null ? '—' : '[' + c.ci95[0].toFixed(3) + ', ' + c.ci95[1].toFixed(3) + ']';
       return '<tr' + (c.shipped ? ' class="shipped"' : '') + '><td>' + esc(c.name) + '</td><td class="num">' + c.summary.mae.toFixed(3) +
         '</td><td class="num">' + c.summary.median.toFixed(3) + '</td><td class="num">' + Math.round(c.summary.medianPct) +
         '%</td><td class="num">' + Math.round(c.summary.within2 * 100) + '%</td><td class="num">' + Math.round(c.summary.within3 * 100) + '%</td>' +
         '<td class="num">' + (c.pairedT === null ? '—' : signed(c.pairedT)) + '</td><td class="num">' + (c.cohensD === null ? '—' : signed(c.cohensD)) +
-        '</td><td class="num">' + ci + '</td></tr>';
+        '</td><td class="num">' + ci + '</td><td class="num">' + share(c.winShare) + '</td></tr>';
     }).join('');
     var splitRows = D.harder_splits.map(function (s) {
       return '<tr' + (s.shipped ? ' class="shipped"' : '') + '><td>' + esc(s.name) + '</td><td class="num">' + s.loo_mae.toFixed(3) +
@@ -348,8 +358,8 @@
       '), with R\u00b2 ' + m.r_squared.toFixed(3) + ' and a residual standard deviation of ' + m.resid_sd.toFixed(3) + ' dex on the kept set. That scatter is the story of this snapshot: token values genuinely spread about eightfold around any TVL curve, which is why every row carries an interval.</p>' +
       '<p><b>How the shipped specification was chosen.</b> ' + esc(D.selection.note) + ' The rule is fixed in the code: among the power-law parameter variants — the only family the page can recompute row by row — the lowest leave-one-out MAE ships only when it beats the v4 specification with a paired t below \u22122. Structural alternatives (joint regressions, neighbours, ensembles) are tested and reported below but can never ship, because a shipped form the reader cannot re-derive would break the recompute check in every detail view.</p>' +
       '<h3>2. The bake-off: ' + cands.length + ' specifications, judged by paired test</h3>' +
-      '<p>Each specification below was leave-one-out backtested on the same ' + m.live_count + ' live protocols, refitting on every fold, and compared to the shipped specification by a paired t-test over the same folds — the same protocol held out each time, so the comparison carries no fold noise. A |t| under 2 is indistinguishable from chance. Cohen\u2019s d puts the size of each gap next to its significance, and the 95% interval shows where the true mean difference lies. The shipped specification ranks ' + shippedRank + ' of ' + cands.length + ' by MAE; the ' + leaders.length + ' rows ahead of it lead by at most ' + bestGap.toFixed(3) + ' dex with paired |t| under ' + maxLeaderT.toFixed(2) + ' and |d| under ' + maxLeaderD.toFixed(2) + ' — noise, not signal — while ' + worseSignificant + ' specifications are significantly worse (t &gt; 2). Chasing a 0.001 gap would be fitting noise. The growth and seasoning adjustments stay because the bounty asks the value to follow from growth and age; the bake-off shows they cost nothing, their removal sitting within |t| 0.2 of the shipped row. Richer fits were tested and lost: joint regression, per-category slopes, a quadratic term, median regression, nearest neighbours and an ensemble all landed behind the simple curve with shrunk offsets, and none of them shipped.</p>' +
-      '<table><thead><tr><th>Specification</th><th class="num">MAE (log)</th><th class="num">Median |err|</th><th class="num">Median error</th><th class="num">Within 2\u00d7</th><th class="num">Within 3\u00d7</th><th class="num">Paired t vs shipped</th><th class="num">Cohen\u2019s d</th><th class="num">95% CI of the gap</th></tr></thead><tbody>' + candRows + '</tbody></table>' +
+      '<p>Each specification below was leave-one-out backtested on the same ' + m.live_count + ' live protocols, refitting on every fold, and compared to the shipped specification by a paired t-test over the same folds — the same protocol held out each time, so the comparison carries no fold noise. A |t| under 2 is indistinguishable from chance. Cohen\u2019s d puts the size of each gap next to its significance, and the 95% interval shows where the true mean difference lies. The Won folds column adds one more angle: the share of folds on which the challenger actually beat the shipped fit, so a mean gap driven by a few folds cannot pass for a routine win. The shipped specification ranks ' + shippedRank + ' of ' + cands.length + ' by MAE; the ' + leaders.length + ' rows ahead of it lead by at most ' + bestGap.toFixed(3) + ' dex with paired |t| under ' + maxLeaderT.toFixed(2) + ' and |d| under ' + maxLeaderD.toFixed(2) + ' — noise, not signal — and the best of them wins only ' + Math.round(maxLeaderWin * 100) + '% of folds, while ' + worseSignificant + ' specifications are significantly worse (t &gt; 2). Chasing a 0.001 gap would be fitting noise. The growth and seasoning adjustments stay because the bounty asks the value to follow from growth and age; the bake-off shows they cost nothing, their removal sitting within |t| 0.2 of the shipped row. Richer fits were tested and lost: joint regression, per-category slopes, a quadratic term, median regression, nearest neighbours and an ensemble all landed behind the simple curve with shrunk offsets, and none of them shipped.</p>' +
+      '<table><thead><tr><th>Specification</th><th class="num">MAE (log)</th><th class="num">Median |err|</th><th class="num">Median error</th><th class="num">Within 2\u00d7</th><th class="num">Within 3\u00d7</th><th class="num">Paired t vs shipped</th><th class="num">Cohen\u2019s d</th><th class="num">95% CI of the gap</th><th class="num">Won folds</th></tr></thead><tbody>' + candRows + '</tbody></table>' +
       '<p>' + splitVerdict + ' A specification that only wins by memorising its own category or size band falls behind here; the shipped row does not.</p>' +
       '<table><thead><tr><th>Closest specifications</th><th class="num">LOO MAE</th><th class="num">Category-holdout MAE</th><th class="num">Size-band-holdout MAE</th></tr></thead><tbody>' + splitRows + '</tbody></table>' +
       '<h3>3. The backtest, and two harder splits</h3>' +
