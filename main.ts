@@ -1,7 +1,7 @@
 // Launch Radar v5: the token-radar-01 entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, runs the forty-five-specification bake-off in
-// lib/model.ts (the selection rule inside buildAll decides whether any
+// lib/model.ts (the selection rule inside buildEntry decides whether any
 // parameter variant beats the v4 specification significantly enough to
 // ship), and writes the whole entry to the output directory: board.json,
 // data.js, the dashboard, the screenshots, and dossier.json last — the gate
@@ -19,11 +19,13 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardProblem, buildAll, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssues, buildEntry, dashboardScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
+// The caps the gate enforces: dashboard source under 64 KiB, at most four
+// screenshots of at most 512 KiB each, dashboard at most 400 files / 4 MiB.
 const TEXT_CAP = 65_536;
 const SHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const DASH_CAPS = { max_files: 400, max_bytes: 4_194_304 };
@@ -53,13 +55,13 @@ if (!existsSync(inputPath)) {
 const outDir = flag('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output')!;
 
 const snap = parseSnapshot(readFileSync(inputPath, 'utf8'));
-const { board, dash } = buildAll(snap);
-const problem = boardProblem(board, snap);
+const { board, dash } = buildEntry(snap);
+const problem = boardIssues(board, snap);
 if (problem !== null) fail(`the model wrote a board the gate refuses: ${problem}`);
 
 mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
-writeFileSync(join(outDir, 'data.js'), dataScript(dash));
+writeFileSync(join(outDir, 'data.js'), dashboardScript(dash));
 
 /** Copy a directory tree of regular files, skipping dot-names, in sorted order. */
 function copyTree(from: string, to: string, rel = ''): string[] {
@@ -82,8 +84,11 @@ function copyTree(from: string, to: string, rel = ''): string[] {
 
 const dashFiles = copyTree(join(ROOT, 'dashboard'), join(outDir, 'dashboard'));
 if (!dashFiles.includes('index.html')) fail('dashboard/ holds no index.html');
+
 const shots = copyTree(join(ROOT, 'screenshots'), join(outDir, 'screenshots'));
-if (shots.length < 3) fail(`screenshots/ holds ${shots.length} images: hand in 3, the board, a detail view and a filtered view`);
+if (shots.length !== 4) {
+  fail(`screenshots/ holds ${shots.length} images: hand in exactly 4 — the board, a protocol detail, the watchlist-filtered view, and the research note`);
+}
 for (const name of shots) {
   if (!SHOT_NAME.test(name)) fail(`screenshots/${name}: names are letters, digits and . _ -, 1 to 128 characters`);
 }
@@ -92,9 +97,10 @@ for (const name of shots) {
 writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, { text_max_bytes: TEXT_CAP, screenshots: SHOT_CAPS, dashboard: DASH_CAPS }));
 
 const best = dash.candidates[0]!;
+const shippedRow = dash.candidates.find((c) => c.shipped)!;
 process.stdout.write(
   `launch-radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${board.length} board rows (${dash.meta.early_size} early), ${dash.live.length} live shown apart\n` +
     `launch-radar: fit log10(mcap) = ${dash.model.intercept.toFixed(4)} + ${dash.model.slope.toFixed(4)} * log10(TVL) on ${dash.model.kept_count} live protocols (${dash.model.trimmed_count} trimmed), R2 = ${dash.model.r_squared}, LOO median error ${Math.round(dash.backtest.medianPct)}%\n` +
-    `launch-radar: bake-off over ${dash.candidates.length} specs; best ${best.name} (MAE ${best.summary.mae.toFixed(3)}); shipped spec MAE ${dash.backtest.mae.toFixed(3)}; selection ${dash.selection.switched ? `switched to ${dash.selection.winner_name}` : 'kept the v4 specification'}; intervals cover ${Math.round(dash.backtest.coverage50 * 100)}% / ${Math.round(dash.backtest.coverage80 * 100)}% out of sample\n` +
+    `launch-radar: bake-off over ${dash.candidates.length} specs; best ${best.name} (MAE ${best.summary.mae.toFixed(3)}, won ${best.winShare === null ? '—' : `${Math.round(best.winShare * 100)}%`} of folds vs shipped); shipped spec MAE ${shippedRow.summary.mae.toFixed(3)}; selection ${dash.selection.switched ? `switched to ${dash.selection.winner_name}` : 'kept the v4 specification'}; intervals cover ${Math.round(dash.backtest.coverage50 * 100)}% / ${Math.round(dash.backtest.coverage80 * 100)}% out of sample\n` +
     `launch-radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, dashboard (${dashFiles.length} files), screenshots (${shots.length}) and dossier.json\n`,
 );
