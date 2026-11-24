@@ -1,5 +1,5 @@
-/* Launch Radar v3 theme: warm paper, deep ink, one cyan accent, one amber
-   signal for the watchlist, one plum line for the fitted curve. Numbers are
+/* Launch Radar v5: warm paper, deep ink, one cyan accent, one amber signal
+   for the watchlist, one plum line for the fitted curve. Numbers are
    tabular; spacing runs on a 4px step. No webfonts, no framework, no network. */
 :root {
   --paper: #f6f3ec;
