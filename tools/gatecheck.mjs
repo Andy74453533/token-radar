@@ -1,23 +1,25 @@
 // Gate self-check, v5: replicates the 7 gate checks from RULES.txt against
 // an output directory, plus the entry's own invariants — dashboard source
 // under 64 KB, 208 rows all pre-token, 5 comparables and 8 farm steps a row,
-// the 45-specification bake-off with paired t-tests, Cohen's d and 95%
-// confidence intervals, the selection rule's outcome recorded, interval
-// coverage reported, versioned families deduplicated, gas wording tiered by
-// chain, and an exact recompute of every row's value and intervals from the
-// published fit. Usage:
+// the 45-specification bake-off with paired t-tests, Cohen's d, 95%
+// confidence intervals and fold-win shares, the selection rule's outcome
+// recorded, interval coverage reported, versioned families deduplicated,
+// gas wording tiered by chain, and an exact recompute of every row's value
+// and intervals from the published fit. Usage:
 //   node tools/gatecheck.mjs <outdir> <snapshot.json>
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildDossier } from '../vendor/makefun-board.ts';
 
-const [,, outDir, snapPath] = process.argv;
+const [, , outDir, snapPath] = process.argv;
 if (!outDir || !snapPath) {
   console.error('usage: node tools/gatecheck.mjs <outdir> <snapshot.json>');
   process.exit(2);
 }
+
 let failures = 0;
 let passes = 0;
+/** One verdict line; the run exits non-zero unless every check passes. */
 function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
   if (ok) passes++;
@@ -28,44 +30,59 @@ const snap = JSON.parse(readFileSync(snapPath, 'utf8'));
 const watch = new Set(snap.watchlist);
 const bySlug = new Map(snap.protocols.map((p) => [p.slug, p]));
 const PLAIN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const L10 = Math.log10;
 
-// --- 1. dashboard_files ---
-const dashDir = join(outDir, 'dashboard');
-const dashFiles = [];
-(function walk(dir, rel) {
+/** Every file under a directory, as paths relative to it, sorted. */
+function listFiles(dir, rel = '') {
+  const out = [];
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = rel ? `${rel}/${e.name}` : e.name;
     if (e.isDirectory()) {
       if (e.name.startsWith('.')) throw new Error(`dot dir ${p}`);
-      walk(join(dir, e.name), p);
-    } else if (e.isFile()) dashFiles.push(p);
+      out.push(...listFiles(join(dir, e.name), p));
+    } else if (e.isFile()) out.push(p);
     else throw new Error(`non-file ${p}`);
   }
-})(dashDir, '');
+  return out;
+}
+
+/** PNG width/height from the IHDR chunk, or null when not a PNG. */
+function pngSize(buf) {
+  if (buf.length < 24 || buf[0] !== 0x89 || buf[1] !== 0x50) return null;
+  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
+
+// --- 1. dashboard_files ---
+const dashDir = join(outDir, 'dashboard');
+const dashFiles = listFiles(dashDir).sort();
 const dashSizes = dashFiles.map((f) => statSync(join(dashDir, f)).size);
 const dashTotal = dashSizes.reduce((a, b) => a + b, 0);
-const hasHtml = dashFiles.includes('index.html');
-const hasCss = dashFiles.some((f) => f.endsWith('.css'));
-const hasJs = dashFiles.some((f) => f.endsWith('.js'));
 const badNames = dashFiles.filter((f) => !PLAIN.test(f.split('/').pop()));
-check('dashboard_files/shape', hasHtml && hasCss && hasJs && dashFiles.length <= 400 && dashTotal <= 4 * 1024 * 1024 && badNames.length === 0,
-  `${dashFiles.length} files, ${dashTotal} bytes`);
+check(
+  'dashboard_files/shape',
+  dashFiles.includes('index.html') && dashFiles.some((f) => f.endsWith('.css')) && dashFiles.some((f) => f.endsWith('.js')) &&
+    dashFiles.length <= 400 && dashTotal <= 4 * 1024 * 1024 && badNames.length === 0,
+  `${dashFiles.length} files, ${dashTotal} bytes`,
+);
 // No network addresses: HTML attribute values, <style> bodies, CSS files,
 // and JS import/export/require/dynamic-import specifiers.
+function htmlHasNetwork(text) {
+  const attrs = [...text.matchAll(/=\s*"([^"]*)"|=\s*'([^']*)'/g)].map((m) => m[1] ?? m[2]);
+  const styles = [...text.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1]);
+  const imports = [...text.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].flatMap((m) =>
+    [...m[1].matchAll(/import\s+[^'"]*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]/g)].map((x) => x[1] ?? x[2]));
+  return [...attrs, ...styles, ...imports].some((v) => /^https?:\/\//.test(v.trim()));
+}
+function jsHasNetwork(text) {
+  const specs = [...text.matchAll(/(?:import\s+[^'"]*from\s*|export\s+[^'"]*from\s*|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]/g)].map((m) => m[1]);
+  return specs.some((s) => /^https?:\/\//.test(s));
+}
 let netOffender = null;
 for (const f of dashFiles) {
   const text = readFileSync(join(dashDir, f), 'utf8');
-  if (f.endsWith('.html')) {
-    const attrs = [...text.matchAll(/=\s*"([^"]*)"|=\s*'([^']*)'/g)].map((m) => m[1] ?? m[2]);
-    const styles = [...text.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1]);
-    const imports = [...text.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].flatMap((m) => [...m[1].matchAll(/import\s+[^'"]*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]/g)].map((x) => x[1] ?? x[2]));
-    if ([...attrs, ...styles, ...imports].some((v) => /^https?:\/\//.test(v.trim()))) netOffender = f;
-  } else if (f.endsWith('.css')) {
-    if (/https?:\/\//.test(text)) netOffender = f;
-  } else if (f.endsWith('.js')) {
-    const specs = [...text.matchAll(/(?:import\s+[^'"]*from\s*|export\s+[^'"]*from\s*|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]/g)].map((m) => m[1]);
-    if (specs.some((s) => /^https?:\/\//.test(s))) netOffender = f;
-  }
+  const hit = f.endsWith('.html') ? htmlHasNetwork(text) : f.endsWith('.css') ? /https?:\/\//.test(text) : f.endsWith('.js') ? jsHasNetwork(text) : false;
+  if (hit) netOffender = f;
 }
 check('dashboard_files/no-network', netOffender === null, netOffender ? `offender: ${netOffender}` : 'no http(s) in attributes, CSS or import specifiers');
 check('dashboard/source-under-64k', dashTotal < 65536, `${dashTotal} bytes total`);
@@ -115,10 +132,6 @@ check('farm_steps', stepsOk, stepsWhy || `${rows.length} rows x 8 steps, all 20-
 // --- 6. screenshots ---
 const shotsDir = join(outDir, 'screenshots');
 const shots = readdirSync(shotsDir, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith('.')).map((e) => e.name).sort();
-function pngSize(buf) {
-  if (buf.length < 24 || buf[0] !== 0x89 || buf[1] !== 0x50) return null;
-  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
-}
 let shotsOk = shots.length >= 3 && shots.length <= 4;
 let shotsWhy = `${shots.length} images`;
 for (const name of shots) {
@@ -149,6 +162,7 @@ check('dossier_matches', dossierOk, dossierWhy);
 // --- extras: the entry's own invariants ---
 const preToken = rows.every((r) => r.mcap_usd === null && r.gecko_id === null && r.symbol === null);
 check('board/208-pre-token', rows.length === 208 && preToken, `${rows.length} rows, all pre-token: ${preToken}`);
+
 const VERSION_TAIL = /\s(v\d+(\.\d+)*|\d+\.\d+(\.\d+)*)$/i;
 const versioned = rows.filter((r) => VERSION_TAIL.test(r.name));
 const baseOf = (name) => name.replace(VERSION_TAIL, '');
@@ -162,8 +176,10 @@ for (const r of rows) {
 const watchVersioned = rows.filter((r) => r.watchlist && VERSION_TAIL.test(r.name));
 check('board/version-families', versioned.length >= 10 && familyDup === null && watchVersioned.length === 0,
   `${versioned.length} versioned rows ranked, no family counted twice${familyDup ? `: ${familyDup}` : ''}, no watchlist row version-tailed`);
+
 const compsOk = rows.every((r) => Array.isArray(r.comparables) && r.comparables.length === 5 && r.comparables.every((c) => bySlug.has(c.slug) && bySlug.get(c.slug).mcap_usd > 0));
 check('board/5-comparables', compsOk, 'every row carries 5 live comparables');
+
 const intervalsOk = rows.every((r) =>
   Array.isArray(r.interval_50) && Array.isArray(r.interval_80) &&
   r.interval_50[0] <= r.implied_value_usd && r.implied_value_usd <= r.interval_50[1] &&
@@ -176,18 +192,28 @@ check('board/intervals-sane', intervalsOk, '50% inside 80%, both contain the val
 const dataText = readFileSync(join(outDir, 'data.js'), 'utf8');
 const RADAR = JSON.parse(dataText.slice('window.RADAR = '.length).replace(/;\s*$/, ''));
 const offsets = new Map(RADAR.model.offsets.map((o) => [o.category, o.offset]));
-const L10 = Math.log10;
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/** The fitted value for a protocol record, from the published parameters. */
+function fittedValue(rec, asOf) {
+  const m = RADAR.model;
+  const growth = 1 + clamp(rec.change_7d ?? 0, m.growth_clamp[0], m.growth_clamp[1]) / 100 * m.growth_weight;
+  let ageDays = typeof rec.age_days === 'number' ? rec.age_days : null;
+  if (ageDays === null && rec.listed_at) {
+    const listedMs = Date.parse(`${rec.listed_at}T00:00:00Z`);
+    const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
+    ageDays = Number.isFinite(listedMs) ? Math.max(0, Math.floor((asOfMs - listedMs) / 86400000)) : null;
+  }
+  const age = ageDays === null ? m.unknown_age_days : ageDays;
+  const season = 1 + m.age_amp * (clamp(age, 0, m.age_cap_days) / m.age_cap_days - 0.5);
+  const key = rec.category === null ? '(uncategorised)' : rec.category;
+  const logValue = m.intercept + m.slope * L10(rec.tvl_usd) + (offsets.get(key) ?? 0) + L10(growth) + L10(season);
+  return clamp(Math.round(Math.pow(10, logValue)), 1, 1e14);
+}
+
 let recomputed = 0;
 let recomputeBad = null;
 for (const r of rows) {
-  const m = RADAR.model;
-  const growth = 1 + clamp(r.change_7d ?? 0, m.growth_clamp[0], m.growth_clamp[1]) / 100 * m.growth_weight;
-  const age = r.age_days === null ? m.unknown_age_days : r.age_days;
-  const season = 1 + m.age_amp * (clamp(age, 0, m.age_cap_days) / m.age_cap_days - 0.5);
-  const key = r.category === null ? '(uncategorised)' : r.category;
-  const logValue = m.intercept + m.slope * L10(r.tvl_usd) + (offsets.get(key) ?? 0) + L10(growth) + L10(season);
-  const value = clamp(Math.round(Math.pow(10, logValue)), 1, 1e14);
+  const value = fittedValue(r, RADAR.meta.as_of);
   const b = RADAR.backtest.bands;
   const lo50 = clamp(Math.round(value * Math.pow(10, b.q25)), 1, 1e14);
   const hi50 = clamp(Math.round(value * Math.pow(10, b.q75)), 1, 1e14);
@@ -203,14 +229,7 @@ let compBad = null;
 let compChecked = 0;
 for (const r of rows) {
   for (const c of r.comparables) {
-    const p = bySlug.get(c.slug);
-    const m = RADAR.model;
-    const growth = 1 + clamp(p.change_7d ?? 0, m.growth_clamp[0], m.growth_clamp[1]) / 100 * m.growth_weight;
-    const ageMs = p.listed_at === null ? null : Math.max(0, Math.floor((Date.parse(`${RADAR.meta.as_of}T00:00:00Z`) - Date.parse(`${p.listed_at}T00:00:00Z`)) / 86400000));
-    const age = ageMs === null ? m.unknown_age_days : ageMs;
-    const season = 1 + m.age_amp * (clamp(age, 0, m.age_cap_days) / m.age_cap_days - 0.5);
-    const key = p.category === null ? '(uncategorised)' : p.category;
-    const fitted = clamp(Math.round(Math.pow(10, m.intercept + m.slope * L10(p.tvl_usd) + (offsets.get(key) ?? 0) + L10(growth) + L10(season))), 1, 1e14);
+    const fitted = fittedValue(bySlug.get(c.slug), RADAR.meta.as_of);
     compChecked++;
     if (fitted !== c.fitted_value_usd && !compBad) compBad = `${r.slug}/${c.slug}: recomputed ${fitted} vs ${c.fitted_value_usd}`;
   }
@@ -224,13 +243,21 @@ const effectOk = RADAR.candidates.every((c) =>
   c.shipped
     ? c.cohensD === null && c.ci95 === null
     : typeof c.cohensD === 'number' && Array.isArray(c.ci95) && c.ci95.length === 2 && c.ci95[0] <= c.ci95[1]);
-check('research/bake-off-45', RADAR.candidates.length === 45 && shipped.length === 1 && naive.length === 1 && pairedOk && effectOk,
-  `${RADAR.candidates.length} candidates, shipped: ${shipped[0]?.name ?? 'none'}, paired t + Cohen's d + 95% CI on every alternative`);
+// The fold-win share is the new diagnostic: null on the shipped row, a
+// share in [0, 1] on every alternative, so the table shows how often each
+// challenger actually beats the shipped fit fold by fold.
+const winOk = RADAR.candidates.every((c) =>
+  c.shipped ? c.winShare === null : typeof c.winShare === 'number' && c.winShare >= 0 && c.winShare <= 1);
+check('research/bake-off-45', RADAR.candidates.length === 45 && shipped.length === 1 && naive.length === 1 && pairedOk && effectOk && winOk,
+  `${RADAR.candidates.length} candidates, shipped: ${shipped[0]?.name ?? 'none'}, paired t + Cohen's d + 95% CI + fold-win share on every alternative`);
+
 check('research/holdouts', RADAR.backtest.loco && RADAR.backtest.band_holdout && RADAR.calibration.length > 0,
   `LOCO MAE ${RADAR.backtest.loco.mae.toFixed(3)}, band MAE ${RADAR.backtest.band_holdout.mae.toFixed(3)}, ${RADAR.calibration.length} calibration rows`);
+
 const splitsOk = Array.isArray(RADAR.harder_splits) && RADAR.harder_splits.length >= 5 && RADAR.harder_splits.length <= 6 &&
   RADAR.harder_splits.some((s) => s.shipped) && RADAR.harder_splits.every((s) => s.loco_mae > 0 && s.band_mae > 0);
 check('research/harder-splits', splitsOk, `${RADAR.harder_splits?.length ?? 0} closest specs with category + band holdouts`);
+
 const snapPre = snap.protocols.filter((p) => p.mcap_usd === null && p.gecko_id === null && p.symbol === null).length;
 const snapPartial = snap.protocols.filter((p) => p.mcap_usd === null && (p.gecko_id !== null || p.symbol !== null)).length;
 const comp = RADAR.composition;
@@ -245,6 +272,7 @@ const selOk = sel && typeof sel.switched === 'boolean' && typeof sel.note === 's
   sel.params.trimRounds === RADAR.model.trim_rounds && sel.params.growthWeight === RADAR.model.growth_weight &&
   sel.params.ageAmp === RADAR.model.age_amp;
 check('research/selection', selOk, sel ? `switched=${sel.switched}, winner: ${sel.winner_name}` : 'no selection record');
+
 // Interval coverage is reported and sane: the 50% band should hold about half the time, the 80% most of it.
 const covOk = typeof RADAR.backtest.coverage50 === 'number' && typeof RADAR.backtest.coverage80 === 'number' &&
   RADAR.backtest.coverage50 >= 0.3 && RADAR.backtest.coverage50 <= 0.7 &&
