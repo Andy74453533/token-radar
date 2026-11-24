@@ -1,12 +1,12 @@
-// Launch Radar v4: the token-radar-01 entrypoint (Node 22, standard library only).
+// Launch Radar v5: the token-radar-01 entrypoint (Node 22, standard library only).
 //
-// Reads the sealed snapshot, fits the power-law model in lib/model.ts to the
-// snapshot's own live protocols, backtests it against twenty-seven
-// alternatives with paired t-tests, and writes the whole entry to the output
-// directory: board.json, data.js, the dashboard, the screenshots, and
-// dossier.json last — the gate re-derives the dossier byte-for-byte, so the
-// vendored library call is the last write and nothing after it touches the
-// output tree.
+// Reads the sealed snapshot, runs the forty-five-specification bake-off in
+// lib/model.ts (the selection rule inside buildAll decides whether any
+// parameter variant beats the v4 specification significantly enough to
+// ship), and writes the whole entry to the output directory: board.json,
+// data.js, the dashboard, the screenshots, and dossier.json last — the gate
+// re-derives the dossier byte-for-byte, so the vendored library call is the
+// last write and nothing after it touches the output tree.
 //
 // In the grader's container the snapshot is /input/snapshot.json and the
 // output is /output. Outside it:
@@ -95,6 +95,6 @@ const best = dash.candidates[0]!;
 process.stdout.write(
   `launch-radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${board.length} board rows (${dash.meta.early_size} early), ${dash.live.length} live shown apart\n` +
     `launch-radar: fit log10(mcap) = ${dash.model.intercept.toFixed(4)} + ${dash.model.slope.toFixed(4)} * log10(TVL) on ${dash.model.kept_count} live protocols (${dash.model.trimmed_count} trimmed), R2 = ${dash.model.r_squared}, LOO median error ${Math.round(dash.backtest.medianPct)}%\n` +
-    `launch-radar: bake-off winner by LOO MAE: ${best.name} (${best.summary.mae.toFixed(3)}); shipped spec MAE ${dash.backtest.mae.toFixed(3)}\n` +
+    `launch-radar: bake-off over ${dash.candidates.length} specs; best ${best.name} (MAE ${best.summary.mae.toFixed(3)}); shipped spec MAE ${dash.backtest.mae.toFixed(3)}; selection ${dash.selection.switched ? `switched to ${dash.selection.winner_name}` : 'kept the v4 specification'}; intervals cover ${Math.round(dash.backtest.coverage50 * 100)}% / ${Math.round(dash.backtest.coverage80 * 100)}% out of sample\n` +
     `launch-radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, dashboard (${dashFiles.length} files), screenshots (${shots.length}) and dossier.json\n`,
 );
